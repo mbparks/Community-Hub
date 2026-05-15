@@ -571,6 +571,7 @@ String validateType(const String& t) {
 
 void handleRoot()  { server.send_P(200, "text/html; charset=utf-8", INDEX_HTML); }
 void handleAdmin() { server.send(200, "text/html; charset=utf-8", buildAdminPage()); }
+void handleWall()  { server.send_P(200, "text/html; charset=utf-8", WALL_HTML); }
 
 void handleAdminAuth() {
   DynamicJsonDocument doc(256);
@@ -885,6 +886,237 @@ void handleWaveRecent() {
   server.send(200, "application/json", out);
 }
 
+// ===================== WALL =====================
+// Shared community graffiti canvas. Strokes are stored as polylines on a fixed
+// 1000x600 virtual canvas; the client scales to fit its viewport.
+//
+// Fade-out timing:
+//   - Strokes are full opacity for 7 days
+//   - Then fade linearly to 20% over the next 7 days
+//   - At 14 days they drop off the wall entirely
+//
+// Memory budget (worst case, fixed allocation):
+//   MAX_STROKES * (metadata + MAX_POINTS * 4 bytes) ~= 150 * (12 + 240) = ~38 KB
+//
+// Persistence happens via the same dirty-flag pattern as messages.
+
+#define MAX_STROKES            150
+#define MAX_POINTS_PER_STROKE  60
+#define WALL_FADE_START_SECS   (7UL  * 86400UL)
+#define WALL_LIFETIME_SECS     (14UL * 86400UL)
+
+struct Stroke {
+  uint32_t       id;
+  unsigned long  createdEpoch;
+  uint8_t        color;       // palette index, see WALL_COLORS in pages.h
+  uint8_t        width;       // brush index, 0..3
+  uint8_t        pointCount;  // 0..MAX_POINTS_PER_STROKE
+  int16_t        xs[MAX_POINTS_PER_STROKE];
+  int16_t        ys[MAX_POINTS_PER_STROKE];
+};
+
+Stroke   strokes[MAX_STROKES];
+int      strokeCount     = 0;
+uint32_t nextStrokeId    = 1;
+bool     wallDirty       = false;
+unsigned long lastWallDirtyTime = 0;
+
+// Drop strokes older than WALL_LIFETIME_SECS. Called before reading, writing,
+// or persisting. Shifts remaining strokes down to fill gaps.
+void pruneStrokes() {
+  unsigned long now = nowSecs();
+  int keep = 0;
+  for (int i = 0; i < strokeCount; i++) {
+    if (now - strokes[i].createdEpoch <= WALL_LIFETIME_SECS) {
+      if (keep != i) strokes[keep] = strokes[i];
+      keep++;
+    }
+  }
+  if (keep != strokeCount) {
+    strokeCount = keep;
+    if (!wallDirty) { wallDirty = true; lastWallDirtyTime = millis(); }
+  }
+}
+
+// Stream save: write strokes directly to file rather than building a giant doc.
+void saveWall() {
+  pruneStrokes();
+  File tmp = LittleFS.open("/wall.tmp", FILE_WRITE);
+  if (!tmp) return;
+  tmp.print("[");
+  for (int i = 0; i < strokeCount; i++) {
+    if (i > 0) tmp.print(",");
+    tmp.print("{\"id\":");
+    tmp.print(strokes[i].id);
+    tmp.print(",\"t\":");
+    tmp.print(strokes[i].createdEpoch);
+    tmp.print(",\"c\":");
+    tmp.print(strokes[i].color);
+    tmp.print(",\"w\":");
+    tmp.print(strokes[i].width);
+    tmp.print(",\"p\":[");
+    for (uint8_t k = 0; k < strokes[i].pointCount; k++) {
+      if (k > 0) tmp.print(",");
+      tmp.print(strokes[i].xs[k]);
+      tmp.print(",");
+      tmp.print(strokes[i].ys[k]);
+    }
+    tmp.print("]}");
+  }
+  tmp.print("]");
+  tmp.close();
+  LittleFS.remove("/wall.json");
+  LittleFS.rename("/wall.tmp", "/wall.json");
+}
+
+void loadWall() {
+  if (!LittleFS.exists("/wall.json")) return;
+  File f = LittleFS.open("/wall.json");
+  if (!f) return;
+  // Each stroke serializes to roughly 200-600 bytes of JSON. Budget 64 KB for
+  // the parse buffer, which comfortably handles a full 150-stroke wall.
+  DynamicJsonDocument doc(65536);
+  if (deserializeJson(doc, f)) { f.close(); return; }
+  JsonArray arr = doc.as<JsonArray>();
+  strokeCount = 0;
+  for (JsonObject o : arr) {
+    if (strokeCount >= MAX_STROKES) break;
+    Stroke& s = strokes[strokeCount];
+    s.id           = o["id"] | nextStrokeId;
+    s.createdEpoch = o["t"]  | 0;
+    s.color        = (uint8_t)(o["c"] | 0);
+    s.width        = (uint8_t)(o["w"] | 1);
+    s.pointCount   = 0;
+    JsonArray p = o["p"];
+    if (!p.isNull()) {
+      // Points are stored as a flat [x0,y0,x1,y1,...] array
+      uint8_t pairs = p.size() / 2;
+      if (pairs > MAX_POINTS_PER_STROKE) pairs = MAX_POINTS_PER_STROKE;
+      for (uint8_t k = 0; k < pairs; k++) {
+        s.xs[k] = (int16_t)(p[k * 2]     | 0);
+        s.ys[k] = (int16_t)(p[k * 2 + 1] | 0);
+      }
+      s.pointCount = pairs;
+    }
+    if (s.id >= nextStrokeId) nextStrokeId = s.id + 1;
+    strokeCount++;
+  }
+  f.close();
+}
+
+// GET /wall — returns all currently-visible strokes.
+// Stream-serializes directly to the response to avoid building a 50+ KB
+// JsonDocument in RAM. Each line is one stroke as JSON.
+void handleWallGet() {
+  pruneStrokes();
+  WiFiClient client = server.client();
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  client.print("[");
+  for (int i = 0; i < strokeCount; i++) {
+    if (i > 0) client.print(",");
+    client.print("{\"id\":");
+    client.print(strokes[i].id);
+    client.print(",\"t\":");
+    client.print(strokes[i].createdEpoch);
+    client.print(",\"c\":");
+    client.print(strokes[i].color);
+    client.print(",\"w\":");
+    client.print(strokes[i].width);
+    client.print(",\"p\":[");
+    for (uint8_t k = 0; k < strokes[i].pointCount; k++) {
+      if (k > 0) client.print(",");
+      client.print(strokes[i].xs[k]);
+      client.print(",");
+      client.print(strokes[i].ys[k]);
+    }
+    client.print("]}");
+  }
+  client.print("]");
+  client.stop();
+}
+
+// POST /wall/stroke — add a new stroke
+//   Body: { color, width, points: [x0,y0,x1,y1,...] }
+void handleWallStroke() {
+  DynamicJsonDocument doc(2048);
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "bad json"); return;
+  }
+  uint8_t color = (uint8_t)(doc["color"] | 0);
+  uint8_t width = (uint8_t)(doc["width"] | 1);
+  // Palette is 0..11 (12 graffiti colors), brushes are 0..3
+  if (color > 11) color = 0;
+  if (width > 3)  width = 1;
+
+  JsonArray p = doc["points"];
+  if (p.isNull() || p.size() < 4 || (p.size() % 2) != 0) {
+    server.send(400, "text/plain", "need at least 2 points (4 values)"); return;
+  }
+
+  pruneStrokes();
+
+  // Evict oldest stroke if full (FIFO; oldest is at [0] since we shift on prune)
+  if (strokeCount >= MAX_STROKES) {
+    for (int i = 0; i < MAX_STROKES - 1; i++) strokes[i] = strokes[i + 1];
+    strokeCount = MAX_STROKES - 1;
+  }
+
+  Stroke& s = strokes[strokeCount];
+  s.id           = nextStrokeId++;
+  s.createdEpoch = nowSecs();
+  s.color        = color;
+  s.width        = width;
+  uint8_t pairs = p.size() / 2;
+  if (pairs > MAX_POINTS_PER_STROKE) pairs = MAX_POINTS_PER_STROKE;
+  for (uint8_t k = 0; k < pairs; k++) {
+    int x = p[k * 2]     | 0;
+    int y = p[k * 2 + 1] | 0;
+    // Clamp to virtual canvas (1000x600) with a small margin
+    if (x < 0)    x = 0;
+    if (x > 1000) x = 1000;
+    if (y < 0)    y = 0;
+    if (y > 600)  y = 600;
+    s.xs[k] = (int16_t)x;
+    s.ys[k] = (int16_t)y;
+  }
+  s.pointCount = pairs;
+  strokeCount++;
+
+  if (!wallDirty) { wallDirty = true; lastWallDirtyTime = millis(); }
+
+  DynamicJsonDocument resp(64);
+  resp["id"] = s.id;
+  String out;
+  serializeJson(resp, out);
+  server.send(200, "application/json", out);
+}
+
+// GET /wall/info — small endpoint for the "wall has N new strokes" indicator
+// on the main board header. Returns latest stroke id and total stroke count.
+void handleWallInfo() {
+  pruneStrokes();
+  uint32_t latestId = 0;
+  for (int i = 0; i < strokeCount; i++) {
+    if (strokes[i].id > latestId) latestId = strokes[i].id;
+  }
+  DynamicJsonDocument doc(96);
+  doc["latest"] = latestId;
+  doc["count"]  = strokeCount;
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// Admin-only: wipe the wall
+void handleAdminWallClear() {
+  if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
+  strokeCount = 0;
+  saveWall();
+  wallDirty = false;
+  server.send(200, "text/plain", "wall cleared");
+}
+
 // Public health endpoint. Mild info only (heap, uptime, client count, storage),
 // kept unauthenticated so it can be polled by external dashboards or an e-paper
 // companion device. Add checkKey() at the top if you'd rather gate it.
@@ -899,6 +1131,10 @@ void handleHealth() {
   // Messages
   doc["msg_count"] = msgCount;
   doc["max_msgs"]  = Config::MAX_MSGS;
+
+  // Wall
+  doc["stroke_count"] = strokeCount;
+  doc["max_strokes"]  = MAX_STROKES;
 
   int claimedCount = 0, pollCount = 0, expiredCount = 0;
   unsigned long now = nowSecs();
@@ -1111,6 +1347,8 @@ void handleAdminFlush() {
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   saveMessages();
   msgsDirty = false;
+  saveWall();
+  wallDirty = false;
   saveTime();
   server.send(200, "text/plain", "flushed");
 }
@@ -1177,11 +1415,13 @@ void setup() {
     loadAdminKey();
     loadIdentityConfig();
     loadMessages();
-    Serial.printf("  Loaded %d message(s).\n", msgCount);
+    loadWall();
+    Serial.printf("  Loaded %d message(s), %d stroke(s).\n", msgCount, strokeCount);
   }
 
   // Public routes
   server.on("/",                   handleRoot);
+  server.on("/wall",               handleWall);
   server.on("/admin",              handleAdmin);
   server.on("/admin/auth", HTTP_POST, handleAdminAuth);
   server.on("/info",               handleInfo);
@@ -1195,6 +1435,9 @@ void setup() {
   server.on("/poll/vote",    HTTP_POST, handlePollVote);
   server.on("/wave",         HTTP_POST, handleWavePost);
   server.on("/wave/recent",  HTTP_GET,  handleWaveRecent);
+  server.on("/wall/data",    HTTP_GET,  handleWallGet);
+  server.on("/wall/stroke",  HTTP_POST, handleWallStroke);
+  server.on("/wall/info",    HTTP_GET,  handleWallInfo);
 
   server.on("/api/status", HTTP_GET, []() {
     unsigned long now = nowSecs();
@@ -1241,6 +1484,7 @@ void setup() {
   server.on("/admin/ota", HTTP_POST, handleAdminOTA, handleAdminOTAUpload);
   server.on("/admin/flush",         handleAdminFlush);
   server.on("/admin/clear",         handleAdminClear);
+  server.on("/admin/wall/clear",    handleAdminWallClear);
   server.on("/admin/delete/post",   handleAdminDeletePost);
 
   server.onNotFound([]() { server.sendHeader("Location", "/"); server.send(302); });
@@ -1259,6 +1503,10 @@ void loop() {
   if (msgsDirty && (now - lastMsgDirtyTime) >= 60000) {
     saveMessages();
     msgsDirty = false;
+  }
+  if (wallDirty && (now - lastWallDirtyTime) >= 60000) {
+    saveWall();
+    wallDirty = false;
   }
   if (now - lastTimeSave > 1800000) {
     saveTime();
