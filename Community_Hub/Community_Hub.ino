@@ -1004,36 +1004,49 @@ void loadWall() {
   f.close();
 }
 
-// GET /wall — returns all currently-visible strokes.
+// GET /wall/data — returns all currently-visible strokes.
 // Stream-serializes directly to the response to avoid building a 50+ KB
-// JsonDocument in RAM. Each line is one stroke as JSON.
+// JsonDocument in RAM. Uses chunked transfer encoding via sendContent().
+//
+// Note: server.send(200, type, "") with an empty body finalizes the response;
+// subsequent writes are ignored. We must call send() with the headers, then
+// use sendContent() repeatedly to stream the body.
 void handleWallGet() {
   pruneStrokes();
-  WiFiClient client = server.client();
+
+  // Build the body in chunks. Each loop iteration accumulates a small string
+  // and flushes it. Keeping the buffer small avoids large RAM spikes.
+  String chunk;
+  chunk.reserve(512);
+
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "application/json", "");
-  client.print("[");
+  server.send(200, "application/json", "");  // headers only
+
+  chunk = "[";
   for (int i = 0; i < strokeCount; i++) {
-    if (i > 0) client.print(",");
-    client.print("{\"id\":");
-    client.print(strokes[i].id);
-    client.print(",\"t\":");
-    client.print(strokes[i].createdEpoch);
-    client.print(",\"c\":");
-    client.print(strokes[i].color);
-    client.print(",\"w\":");
-    client.print(strokes[i].width);
-    client.print(",\"p\":[");
+    if (i > 0) chunk += ",";
+    chunk += "{\"id\":";    chunk += strokes[i].id;
+    chunk += ",\"t\":";     chunk += strokes[i].createdEpoch;
+    chunk += ",\"c\":";     chunk += strokes[i].color;
+    chunk += ",\"w\":";     chunk += strokes[i].width;
+    chunk += ",\"p\":[";
     for (uint8_t k = 0; k < strokes[i].pointCount; k++) {
-      if (k > 0) client.print(",");
-      client.print(strokes[i].xs[k]);
-      client.print(",");
-      client.print(strokes[i].ys[k]);
+      if (k > 0) chunk += ",";
+      chunk += strokes[i].xs[k];
+      chunk += ",";
+      chunk += strokes[i].ys[k];
     }
-    client.print("]}");
+    chunk += "]}";
+
+    // Flush every ~1 KB so we never hold too much in RAM at once
+    if (chunk.length() > 1024) {
+      server.sendContent(chunk);
+      chunk = "";
+    }
   }
-  client.print("]");
-  client.stop();
+  chunk += "]";
+  server.sendContent(chunk);
+  server.sendContent("");  // empty chunk signals end of response
 }
 
 // POST /wall/stroke — add a new stroke
@@ -1504,7 +1517,7 @@ void loop() {
     saveMessages();
     msgsDirty = false;
   }
-  if (wallDirty && (now - lastWallDirtyTime) >= 60000) {
+  if (wallDirty && (now - lastWallDirtyTime) >= 10000) {
     saveWall();
     wallDirty = false;
   }
