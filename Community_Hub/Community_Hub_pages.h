@@ -437,6 +437,7 @@ body[data-tint="night"]     { background-color: #d6d3cc; }
 
 <footer class="site-footer">
   <span id="boardFooter"></span>
+  <span id="hostnameDisplay" style="opacity:0.8"></span>
   <span id="uptimeDisplay">—</span>
 </footer>
 
@@ -960,6 +961,11 @@ function loadInfo() {
     document.getElementById('boardRules').textContent   = d.rules;
     document.getElementById('boardFooter').textContent  = d.footer;
     document.getElementById('uptimeDisplay').textContent = d.uptime;
+    // Show the mDNS address so neighbors can bookmark something memorable.
+    // Most modern phones resolve .local addresses; older Androids may not.
+    if (d.hostname) {
+      document.getElementById('hostnameDisplay').textContent = d.hostname + '.local';
+    }
     // Tagline is owned by applyGreeting() now; the admin-set tagline is no
     // longer shown on the main board (it's still configurable for compatibility).
     applyGreeting();
@@ -1152,6 +1158,15 @@ textarea.restore-area:focus { border-color: var(--accent-dark); }
         <label>Footer</label>
         <input type="text" id="idFooter" maxlength="80" style="width:100%">
       </div>
+      <div class="fld" style="flex:1">
+        <label>Hostname (optional, for <span id="idHostnamePreview" style="font-family:monospace;color:var(--accent-dark)">hub</span>.local)</label>
+        <input type="text" id="idHostname" maxlength="30" style="width:100%"
+               placeholder="(leave blank to derive from Board Name)"
+               oninput="updateHostnamePreview()">
+        <div style="font-size:10px;color:var(--ink-muted);margin-top:2px">
+          Lowercase letters, digits, and hyphens only. Non-allowed characters get stripped.
+        </div>
+      </div>
       <div class="row">
         <button class="btn" onclick="doIdentity()">Save Identity</button>
       </div>
@@ -1343,16 +1358,54 @@ function doSetKey() {
 
 function doIdentity() {
   const params = new URLSearchParams({
-    name:    document.getElementById('idName').value.trim(),
-    icon:    document.getElementById('idIcon').value.trim(),
-    tagline: document.getElementById('idTagline').value.trim(),
-    rules:   document.getElementById('idRules').value.trim(),
-    footer:  document.getElementById('idFooter').value.trim()
+    name:     document.getElementById('idName').value.trim(),
+    icon:     document.getElementById('idIcon').value.trim(),
+    tagline:  document.getElementById('idTagline').value.trim(),
+    rules:    document.getElementById('idRules').value.trim(),
+    footer:   document.getElementById('idFooter').value.trim(),
+    hostname: document.getElementById('idHostname').value.trim()
   });
   apiFetch(api('/admin/identity/set') + '&' + params.toString())
-    .then(r => r.text()).then(msg => fb('idFb', '✓ ' + msg))
+    .then(r => r.text()).then(msg => fb('idFb', '✓ ' + msg + ' (mDNS may take a moment to re-advertise)'))
     .catch(() => fb('idFb', '✗ Request failed'));
 }
+
+// Mirror the server-side slugify() rules so the admin sees what address will
+// actually be advertised before they save. Default behavior (empty hostname
+// field) uses the first word of Board Name.
+function slugifyJS(s) {
+  let out = '';
+  let lastHyphen = true;
+  for (const ch of s.toLowerCase()) {
+    if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+      out += ch; lastHyphen = false;
+    } else if (ch === ' ' || ch === '-' || ch === '_' || ch === '.') {
+      if (!lastHyphen) { out += '-'; lastHyphen = true; }
+    }
+    if (out.length >= 30) break;
+  }
+  while (out.endsWith('-')) out = out.slice(0, -1);
+  return out || 'hub';
+}
+
+function updateHostnamePreview() {
+  const override = document.getElementById('idHostname').value.trim();
+  let effective;
+  if (override.length > 0) {
+    effective = slugifyJS(override);
+  } else {
+    const name = document.getElementById('idName').value.trim();
+    const firstWord = name.split(/\s+/)[0] || '';
+    effective = slugifyJS(firstWord);
+  }
+  document.getElementById('idHostnamePreview').textContent = effective;
+}
+
+// Keep the preview in sync if Board Name changes while hostname is blank
+document.addEventListener('DOMContentLoaded', () => {
+  const nameInput = document.getElementById('idName');
+  if (nameInput) nameInput.addEventListener('input', updateHostnamePreview);
+});
 
 function doTime() {
   const raw = document.getElementById('timeIn').value;

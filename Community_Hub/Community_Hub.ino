@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <Update.h>
 #include "FS.h"
 #include "LittleFS.h"
@@ -53,8 +54,8 @@ namespace Config {
   // SSID is what neighbours see in their WiFi list.
   // AP_PASS must be empty for an open network, or 8+ characters for WPA2.
   // Anything 1-7 chars will cause softAP() to fail silently.
-  const char* AP_SSID     = "Sunbury Hub";
-  const char* AP_PASS     = "sunbury123";        // "" = open network
+  const char* AP_SSID     = "Fountain Head Hub";
+  const char* AP_PASS     = "fountain";        // "" = open network
   const int   AP_CHANNEL  = 6;
   const int   AP_MAX_CONN = 20;
 
@@ -76,19 +77,80 @@ namespace Config {
 // These shadow the Config defaults and can be changed via the admin panel.
 // Persisted to /identity.json.
 
-String id_name    = Config::LOCALITY_NAME;
-String id_icon    = Config::BOARD_ICON;
-String id_tagline = Config::BOARD_TAGLINE;
-String id_rules   = Config::BOARD_RULES;
-String id_footer  = Config::BOARD_FOOTER;
+String id_name     = Config::LOCALITY_NAME;
+String id_icon     = Config::BOARD_ICON;
+String id_tagline  = Config::BOARD_TAGLINE;
+String id_rules    = Config::BOARD_RULES;
+String id_footer   = Config::BOARD_FOOTER;
+String id_hostname = "";   // empty = derive from id_name; non-empty = explicit override
+
+// Slug a string for use as an mDNS hostname. Rules:
+//   - Lowercase ASCII letters, digits, and hyphens only
+//   - Non-ASCII characters and punctuation are dropped
+//   - Whitespace becomes a hyphen
+//   - Runs of hyphens are collapsed, leading/trailing hyphens stripped
+//   - Result is capped at 30 chars (mDNS spec allows 63, but shorter is friendlier)
+//   - Empty result falls back to "hub"
+String slugify(const String& in) {
+  String out;
+  out.reserve(in.length());
+  bool lastWasHyphen = true;  // start true to strip leading hyphens
+  for (unsigned int i = 0; i < in.length() && (int)out.length() < 30; i++) {
+    char c = in.charAt(i);
+    if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+      out += c;
+      lastWasHyphen = false;
+    } else if (c == ' ' || c == '-' || c == '_' || c == '.') {
+      if (!lastWasHyphen) { out += '-'; lastWasHyphen = true; }
+    }
+    // anything else (punctuation, emoji, non-ASCII) is silently dropped
+  }
+  // Strip trailing hyphen
+  while (out.length() && out.charAt(out.length() - 1) == '-') {
+    out.remove(out.length() - 1);
+  }
+  if (out.length() == 0) out = "hub";
+  return out;
+}
+
+// Compute the effective mDNS hostname. If id_hostname is explicitly set, use
+// its slug. Otherwise, slug the first whitespace-separated word of id_name.
+// This keeps the default short: "Sunbury Hub" -> "sunbury", not "sunbury-hub".
+String effectiveHostname() {
+  if (id_hostname.length() > 0) return slugify(id_hostname);
+  int sp = id_name.indexOf(' ');
+  String first = (sp > 0) ? id_name.substring(0, sp) : id_name;
+  return slugify(first);
+}
+
+// Track what we last advertised, so we know whether to restart mDNS on
+// identity changes.
+String currentMdnsName = "";
+
+void startMdns() {
+  String h = effectiveHostname();
+  if (h == currentMdnsName) return;  // no change
+  if (currentMdnsName.length() > 0) {
+    MDNS.end();
+  }
+  if (MDNS.begin(h.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+    currentMdnsName = h;
+    Serial.printf("✓ mDNS started: http://%s.local\n", h.c_str());
+  } else {
+    Serial.println("⚠  MDNS.begin() failed.");
+  }
+}
 
 void saveIdentityConfig() {
   DynamicJsonDocument doc(1024);
-  doc["name"]    = id_name;
-  doc["icon"]    = id_icon;
-  doc["tagline"] = id_tagline;
-  doc["rules"]   = id_rules;
-  doc["footer"]  = id_footer;
+  doc["name"]     = id_name;
+  doc["icon"]     = id_icon;
+  doc["tagline"]  = id_tagline;
+  doc["rules"]    = id_rules;
+  doc["footer"]   = id_footer;
+  doc["hostname"] = id_hostname;
 
   File tmp = LittleFS.open("/id.tmp", FILE_WRITE);
   if (!tmp) return;
@@ -104,11 +166,13 @@ void loadIdentityConfig() {
   if (!f) return;
   DynamicJsonDocument doc(1024);
   if (!deserializeJson(doc, f)) {
-    if (doc["name"].as<String>().length())    id_name    = doc["name"].as<String>();
-    if (doc["icon"].as<String>().length())    id_icon    = doc["icon"].as<String>();
-    if (doc["tagline"].as<String>().length()) id_tagline = doc["tagline"].as<String>();
-    if (doc["rules"].as<String>().length())   id_rules   = doc["rules"].as<String>();
-    if (doc["footer"].as<String>().length())  id_footer  = doc["footer"].as<String>();
+    if (doc["name"].as<String>().length())    id_name     = doc["name"].as<String>();
+    if (doc["icon"].as<String>().length())    id_icon     = doc["icon"].as<String>();
+    if (doc["tagline"].as<String>().length()) id_tagline  = doc["tagline"].as<String>();
+    if (doc["rules"].as<String>().length())   id_rules    = doc["rules"].as<String>();
+    if (doc["footer"].as<String>().length())  id_footer   = doc["footer"].as<String>();
+    // hostname may be absent in old files; empty string means "derive from name"
+    id_hostname = doc["hostname"].as<String>();
   }
   f.close();
 }
@@ -528,11 +592,13 @@ String buildAdminPage() {
   page += "let SESSION_TOKEN = '';\n";
 
   page += "window.addEventListener('DOMContentLoaded', () => {\n";
-  page += "  document.getElementById('idName').value    = \"" + jsEscape(id_name)    + "\";\n";
-  page += "  document.getElementById('idIcon').value    = \"" + jsEscape(id_icon)    + "\";\n";
-  page += "  document.getElementById('idTagline').value = \"" + jsEscape(id_tagline) + "\";\n";
-  page += "  document.getElementById('idRules').value   = \"" + jsEscape(id_rules)   + "\";\n";
-  page += "  document.getElementById('idFooter').value  = \"" + jsEscape(id_footer)  + "\";\n";
+  page += "  document.getElementById('idName').value     = \"" + jsEscape(id_name)     + "\";\n";
+  page += "  document.getElementById('idIcon').value     = \"" + jsEscape(id_icon)     + "\";\n";
+  page += "  document.getElementById('idTagline').value  = \"" + jsEscape(id_tagline)  + "\";\n";
+  page += "  document.getElementById('idRules').value    = \"" + jsEscape(id_rules)    + "\";\n";
+  page += "  document.getElementById('idFooter').value   = \"" + jsEscape(id_footer)   + "\";\n";
+  page += "  document.getElementById('idHostname').value = \"" + jsEscape(id_hostname) + "\";\n";
+  page += "  updateHostnamePreview();\n";
   page += "});\n";
 
   page += FPSTR(ADMIN_PAGE_TAIL);
@@ -590,12 +656,13 @@ void handleAdminAuth() {
 
 void handleInfo() {
   DynamicJsonDocument doc(512);
-  doc["name"]    = id_name;
-  doc["icon"]    = id_icon;
-  doc["tagline"] = id_tagline;
-  doc["rules"]   = id_rules;
-  doc["footer"]  = id_footer;
-  doc["uptime"]  = formatUptime();
+  doc["name"]     = id_name;
+  doc["icon"]     = id_icon;
+  doc["tagline"]  = id_tagline;
+  doc["rules"]    = id_rules;
+  doc["footer"]   = id_footer;
+  doc["hostname"] = effectiveHostname();
+  doc["uptime"]   = formatUptime();
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -915,7 +982,11 @@ struct Stroke {
   int16_t        ys[MAX_POINTS_PER_STROKE];
 };
 
-Stroke   strokes[MAX_STROKES];
+// Heap-allocated in setup() rather than static, because at ~37 KB this array
+// overflows the ESP32's DRAM `.bss` section if declared statically alongside
+// the WiFi stack, message buffers, and identity strings. The heap allocation
+// reserves the same RAM but does it at runtime, after the linker is done.
+Stroke*  strokes         = nullptr;
 int      strokeCount     = 0;
 uint32_t nextStrokeId    = 1;
 bool     wallDirty       = false;
@@ -924,6 +995,7 @@ unsigned long lastWallDirtyTime = 0;
 // Drop strokes older than WALL_LIFETIME_SECS. Called before reading, writing,
 // or persisting. Shifts remaining strokes down to fill gaps.
 void pruneStrokes() {
+  if (!strokes) return;
   unsigned long now = nowSecs();
   int keep = 0;
   for (int i = 0; i < strokeCount; i++) {
@@ -940,6 +1012,7 @@ void pruneStrokes() {
 
 // Stream save: write strokes directly to file rather than building a giant doc.
 void saveWall() {
+  if (!strokes) return;
   pruneStrokes();
   File tmp = LittleFS.open("/wall.tmp", FILE_WRITE);
   if (!tmp) return;
@@ -970,6 +1043,7 @@ void saveWall() {
 }
 
 void loadWall() {
+  if (!strokes) return;
   if (!LittleFS.exists("/wall.json")) return;
   File f = LittleFS.open("/wall.json");
   if (!f) return;
@@ -1052,6 +1126,7 @@ void handleWallGet() {
 // POST /wall/stroke — add a new stroke
 //   Body: { color, width, points: [x0,y0,x1,y1,...] }
 void handleWallStroke() {
+  if (!strokes) { server.send(503, "text/plain", "wall unavailable"); return; }
   DynamicJsonDocument doc(2048);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json"); return;
@@ -1190,11 +1265,13 @@ void handleHealth() {
 void handleAdminIdentityGet() {
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   DynamicJsonDocument doc(1024);
-  doc["name"]    = id_name;
-  doc["icon"]    = id_icon;
-  doc["tagline"] = id_tagline;
-  doc["rules"]   = id_rules;
-  doc["footer"]  = id_footer;
+  doc["name"]              = id_name;
+  doc["icon"]              = id_icon;
+  doc["tagline"]           = id_tagline;
+  doc["rules"]             = id_rules;
+  doc["footer"]            = id_footer;
+  doc["hostname"]          = id_hostname;          // raw override, may be empty
+  doc["effectiveHostname"] = effectiveHostname();  // the slug we actually advertise
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -1212,7 +1289,16 @@ void handleAdminIdentitySet() {
     id_rules   = sanitize(server.arg("rules"),   100);
   if (server.hasArg("footer"))
     id_footer  = sanitize(server.arg("footer"),  100);
+  if (server.hasArg("hostname")) {
+    // Slug client-side input too so admin can type whatever; we store the slug
+    // (or empty if they cleared it, meaning "derive from name").
+    String raw = server.arg("hostname");
+    raw.trim();
+    id_hostname = raw.length() ? slugify(raw) : "";
+  }
   saveIdentityConfig();
+  // Re-advertise mDNS in case the effective hostname changed.
+  startMdns();
   server.send(200, "text/plain", "identity saved");
 }
 
@@ -1419,6 +1505,17 @@ void setup() {
 
   dnsServer.start(53, "*", apIP);
 
+  // Heap allocation for the strokes ring buffer. ~37 KB at MAX_STROKES=150.
+  // Done here rather than statically to keep DRAM `.bss` within ESP32 limits.
+  // If this fails the wall stays disabled but the rest of the board works fine.
+  strokes = (Stroke*) calloc(MAX_STROKES, sizeof(Stroke));
+  if (!strokes) {
+    Serial.println("⚠  Failed to allocate strokes buffer — wall disabled.");
+  } else {
+    Serial.printf("✓ Strokes buffer allocated: %u bytes\n",
+                  (unsigned)(MAX_STROKES * sizeof(Stroke)));
+  }
+
   if (!LittleFS.begin(true)) {
     Serial.println("⚠  LittleFS init failed — running without persistence.");
   } else {
@@ -1428,9 +1525,14 @@ void setup() {
     loadAdminKey();
     loadIdentityConfig();
     loadMessages();
-    loadWall();
+    if (strokes) loadWall();  // skip wall load if allocation failed
     Serial.printf("  Loaded %d message(s), %d stroke(s).\n", msgCount, strokeCount);
   }
+
+  // mDNS: advertise http://<hostname>.local so neighbors don't have to memorize
+  // the IP. Must come after identity loads (so we know the effective hostname)
+  // and after the AP is up (so there's a network interface to bind to).
+  startMdns();
 
   // Public routes
   server.on("/",                   handleRoot);
