@@ -1,8 +1,10 @@
 /*
  * ╔═══════════════════════════════════════╗
- * ║      C O M M U N I T Y  H U B         ║
+ * ║           PROJECT LANTERN             ║
  * ║        Local Bulletin Board           ║
  * ╚═══════════════════════════════════════╝
+ *
+ * Fork of https://github.com/SonicDH/Community-Hub 
  *
  * Hardware : ESP32-C3  (also builds for ESP32 WROOM, watch LED_PIN choice)
  * Storage  : Internal Flash via LittleFS
