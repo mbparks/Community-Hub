@@ -1,5 +1,7 @@
 # Project Lantern (fork of Community Hub), Changes Since Initial Sketch
 
+Fork of https://github.com/SonicDH/Community-Hub
+
 This document covers everything added, changed, or restructured between the
 original `Community_Hub.ino` and the current state of the sketch. It does not
 re-document features that were present in the original.
