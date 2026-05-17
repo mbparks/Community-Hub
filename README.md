@@ -1,4 +1,4 @@
-# Community Hub, Changes Since Initial Sketch
+# Project Lantern (fork of Community Hub), Changes Since Initial Sketch
 
 This document covers everything added, changed, or restructured between the
 original `Community_Hub.ino` and the current state of the sketch. It does not
