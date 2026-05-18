@@ -191,6 +191,30 @@ body {
 .type-Poll   .card-stripe { background: var(--c-poll-bar);  }
 .type-Poll   .cat-badge   { background: var(--c-poll-bg);   color: var(--c-poll-fg);   }
 
+/* ── Pinned post ──
+   Rendered in #pinnedSlot above the main board. Same card shape, plus a warm
+   gold border and a small "📌 Pinned" ribbon so it reads as elevated, not
+   shouty. The post still keeps its own type colors via .type-Notice/Offer/etc */
+#pinnedSlot { margin-bottom: 14px; }
+#pinnedSlot:empty { display: none; }
+.pinned-wrap {
+  position: relative;
+  border: 2px solid #c9a149;
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, #fbf4dd 0%, var(--surface) 60%);
+  box-shadow: 0 0 0 1px #f0e0a8 inset, var(--shadow);
+  overflow: hidden;
+}
+.pinned-ribbon {
+  display: flex; align-items: center; gap: 6px;
+  background: #c9a149; color: #fffdf2;
+  padding: 4px 11px;
+  font-size: 10px; font-weight: bold; letter-spacing: 1.5px; text-transform: uppercase;
+}
+.pinned-wrap .card {
+  margin: 0; border: none; border-radius: 0; box-shadow: none; background: transparent;
+}
+
 /* Claim badge */
 .claim-banner {
   margin-top: 8px; padding: 6px 10px; background: var(--c-offer-bg);
@@ -433,6 +457,8 @@ body[data-tint="night"]     { background-color: #d6d3cc; }
   <button class="ftab"        id="sExp" onclick="setSort('exp', this)">Expiring</button>
 </div>
 
+<div id="pinnedSlot"></div>
+
 <div class="board" id="board"></div>
 
 <footer class="site-footer">
@@ -498,6 +524,7 @@ let currentExpiry = 168;
 let activeFilter  = '';
 let activeSort    = 'new';
 let lastData      = [];
+let currentPinnedId = 0;   // set by loadInfo(); 0 = nothing pinned
 
 // Name color palette. Index 0 = default ink, 1..7 = picks.
 // Indices are persisted server-side as uint8_t, so don't shuffle these.
@@ -673,30 +700,17 @@ function renderReactions(m) {
   '</div>';
 }
 
-function render(data) {
-  let filtered = activeFilter ? data.filter(m => m.type === activeFilter) : data;
-  if (activeSort === 'exp') {
-    filtered = [...filtered].sort((a, b) => a.expires - b.expires);
-  }
-
-  document.getElementById('postCount').textContent =
-    data.length + ' post' + (data.length !== 1 ? 's' : '');
-
-  const board = document.getElementById('board');
-  if (filtered.length === 0) {
-    board.innerHTML = '<div class="empty">Nothing here yet.<br>Be the first to post.</div>';
-    return;
-  }
-
-  board.innerHTML = filtered.map(m => {
-    const tl     = timeLeft(m.expires);
-    const isPoll = m.type === 'Poll' && Array.isArray(m.options) && m.options.length >= 2;
-    const claimBanner = m.claimed
-      ? `<div class="claim-banner"><span>✓ Claimed by <b>${esc(m.claimedBy || 'someone')}</b></span></div>`
-      : '';
-    const colorIdx = Math.max(0, Math.min(7, Number(m.authorColor || 0)));
-    const colorStyle = colorIdx > 0 ? ` style="color:${NAME_COLORS[colorIdx]}"` : '';
-    return `
+// Build the HTML for one post card. Used both for the main board grid and for
+// the pinned slot above it. Pure HTML; binds nothing.
+function buildCardHTML(m) {
+  const tl     = timeLeft(m.expires);
+  const isPoll = m.type === 'Poll' && Array.isArray(m.options) && m.options.length >= 2;
+  const claimBanner = m.claimed
+    ? `<div class="claim-banner"><span>✓ Claimed by <b>${esc(m.claimedBy || 'someone')}</b></span></div>`
+    : '';
+  const colorIdx = Math.max(0, Math.min(7, Number(m.authorColor || 0)));
+  const colorStyle = colorIdx > 0 ? ` style="color:${NAME_COLORS[colorIdx]}"` : '';
+  return `
 <div class="card type-${esc(m.type)}" id="card-${m.id}">
   <div class="card-stripe"></div>
   <div class="card-body">
@@ -712,7 +726,47 @@ function render(data) {
     <span class="card-expiry${tl.soon ? ' soon' : ''}">${tl.label}</span>
   </div>
 </div>`;
-  }).join('');
+}
+
+function render(data) {
+  // Pinned post (if any) renders into its own slot above the board, regardless
+  // of the active filter or sort. We then skip it in the main grid to avoid
+  // showing the same card twice.
+  const pinnedSlot = document.getElementById('pinnedSlot');
+  if (currentPinnedId) {
+    const pm = data.find(m => m.id === currentPinnedId);
+    if (pm) {
+      pinnedSlot.innerHTML =
+        '<div class="pinned-wrap">' +
+          '<div class="pinned-ribbon">📌 Pinned</div>' +
+          buildCardHTML(pm) +
+        '</div>';
+    } else {
+      pinnedSlot.innerHTML = '';
+    }
+  } else {
+    pinnedSlot.innerHTML = '';
+  }
+
+  let filtered = activeFilter ? data.filter(m => m.type === activeFilter) : data;
+  // Don't repeat the pinned card in the regular grid.
+  if (currentPinnedId) filtered = filtered.filter(m => m.id !== currentPinnedId);
+  if (activeSort === 'exp') {
+    filtered = [...filtered].sort((a, b) => a.expires - b.expires);
+  }
+
+  document.getElementById('postCount').textContent =
+    data.length + ' post' + (data.length !== 1 ? 's' : '');
+
+  const board = document.getElementById('board');
+  if (filtered.length === 0) {
+    board.innerHTML = currentPinnedId
+      ? ''
+      : '<div class="empty">Nothing here yet.<br>Be the first to post.</div>';
+    return;
+  }
+
+  board.innerHTML = filtered.map(buildCardHTML).join('');
 }
 
 // ── Post ──────────────────────────────────────────────────────────────────────
@@ -966,6 +1020,13 @@ function loadInfo() {
     if (d.hostname) {
       document.getElementById('hostnameDisplay').textContent = d.hostname + '.local';
     }
+    // If the pinned post changed (admin pinned/unpinned), re-render so the
+    // pinned slot stays in sync without waiting for the next /messages poll.
+    const nextPinned = Number(d.pinned || 0);
+    if (nextPinned !== currentPinnedId) {
+      currentPinnedId = nextPinned;
+      if (lastData.length) render(lastData);
+    }
     // Tagline is owned by applyGreeting() now; the admin-set tagline is no
     // longer shown on the main board (it's still configurable for compatibility).
     applyGreeting();
@@ -1091,10 +1152,72 @@ textarea.restore-area:focus { border-color: var(--accent-dark); }
   border: 1px solid var(--border-light); border-radius: var(--radius);
   padding: 8px 10px; font-size: 12px;
 }
+.post-row.is-pinned {
+  background: #fbf4dd;
+  border-color: #c9a149;
+  box-shadow: 0 0 0 1px #f0e0a8 inset;
+}
 .post-row-info { flex: 1; min-width: 0; }
 .post-row-meta { font-size: 10px; color: var(--ink-muted); margin-bottom: 2px; }
 .post-row-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink); }
+.post-row-actions { display: flex; gap: 5px; flex-shrink: 0; }
+.post-row .pin-badge {
+  display: inline-block;
+  background: #c9a149; color: #fffdf2;
+  font-size: 9px; font-weight: bold; letter-spacing: 1px; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 99px;
+  margin-right: 6px;
+}
 .post-empty { font-size: 12px; color: var(--ink-muted); font-style: italic; padding: 8px 0; }
+
+.pinned-status {
+  background: #fbf4dd;
+  border: 1px solid #c9a149;
+  border-radius: var(--radius);
+  padding: 8px 11px;
+  font-size: 12px;
+  margin-bottom: 10px;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.pinned-status:empty { display: none; }
+.pinned-status.none {
+  background: var(--bg);
+  border-color: var(--border-light);
+  color: var(--ink-muted);
+  font-style: italic;
+}
+
+/* Stats tiles */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+.stat-tile {
+  background: var(--bg);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.stat-tile .stat-label {
+  font-size: 10px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--ink-muted);
+}
+.stat-tile .stat-value {
+  font-size: 20px; font-weight: bold; color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.stat-tile .stat-sub {
+  font-size: 10px; color: var(--ink-muted);
+}
+.stat-tile.wide { grid-column: 1 / -1; }
+.stat-types {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  font-size: 11px;
+}
+.stat-types span { display: inline-flex; gap: 4px; }
+.stat-types b { font-variant-numeric: tabular-nums; color: var(--ink); }
 </style>
 </head>
 <body>
@@ -1238,8 +1361,20 @@ textarea.restore-area:focus { border-color: var(--accent-dark); }
 </div>
 
   <div class="section">
+    <div class="section-head">Stats</div>
+    <div class="section-body">
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn" onclick="loadStats()">Refresh</button>
+        <span class="feedback" id="statsFb" style="font-size:11px"></span>
+      </div>
+      <div id="statsGrid" class="stats-grid"></div>
+    </div>
+  </div>
+
+  <div class="section">
     <div class="section-head">Manage Posts</div>
     <div class="section-body">
+      <div id="pinnedStatus" class="pinned-status"></div>
       <div class="row">
         <button class="btn" onclick="loadPostList()">Refresh List</button>
         <button class="btn danger" onclick="confirmClear()">Clear All Posts</button>
@@ -1320,6 +1455,7 @@ function tryLogin() {
     document.getElementById('timeIn').value = now.toISOString().slice(0, 16);
     loadLedValues();
     loadPostList();
+    loadStats();
   })
   .catch(() => { document.getElementById('gateErr').textContent = 'Incorrect key.'; });
 }
@@ -1490,39 +1626,168 @@ function timeLeftShort(exp) {
   if (left < 86400)  return Math.floor(left/3600) + 'h';
   return Math.floor(left/86400) + 'd';
 }
+// Cached pinned id so we don't have to re-fetch /info on every list re-render.
+// Kept in sync via loadPostList()'s /info call and any pin/unpin action.
+let adminPinnedId = 0;
+
+function renderPinnedStatus() {
+  const el = document.getElementById('pinnedStatus');
+  if (!el) return;
+  if (!adminPinnedId) {
+    el.className = 'pinned-status none';
+    el.textContent = 'No post pinned.';
+    return;
+  }
+  el.className = 'pinned-status';
+  el.innerHTML =
+    `<span>📌 Post <b>#${adminPinnedId}</b> is currently pinned.</span>` +
+    `<button class="btn" onclick="doUnpin()">Unpin</button>`;
+}
+
+// Fetches /info and /messages in parallel, then renders the post list with a
+// Pin/Unpin button per row plus a highlight on whichever row is pinned.
 async function loadPostList() {
   const container = document.getElementById('postList');
   container.innerHTML = '<div class="post-empty">Loading…</div>';
   try {
-    const r    = await fetch('/messages');
-    const data = await r.json();
+    const [infoR, msgsR] = await Promise.all([
+      fetch('/info'),
+      fetch('/messages')
+    ]);
+    const info = await infoR.json();
+    const data = await msgsR.json();
+    adminPinnedId = Number(info.pinned || 0);
+    renderPinnedStatus();
+
     if (data.length === 0) {
       container.innerHTML = '<div class="post-empty">No active posts.</div>';
       return;
     }
+
+    // Sort so the pinned post (if present) floats to the top.
+    const sorted = [...data].sort((a, b) => {
+      const ap = (a.id === adminPinnedId) ? 0 : 1;
+      const bp = (b.id === adminPinnedId) ? 0 : 1;
+      return ap - bp;
+    });
+
     container.innerHTML = '<div class="post-list">' +
-      data.map(m => {
+      sorted.map(m => {
         const claim = m.claimed ? ' · claimed by ' + esc(m.claimedBy || 'someone') : '';
+        const isPinned = (m.id === adminPinnedId);
+        const pinBadge = isPinned ? '<span class="pin-badge">📌 Pinned</span>' : '';
+        const pinBtn = isPinned
+          ? `<button class="btn" onclick="doUnpin()">Unpin</button>`
+          : `<button class="btn" onclick="doPin(${m.id})">Pin</button>`;
         return `
-<div class="post-row" id="pr-${m.id}">
+<div class="post-row${isPinned ? ' is-pinned' : ''}" id="pr-${m.id}">
   <div class="post-row-info">
-    <div class="post-row-meta">${esc(m.type)} · ${esc(m.author)} · ${timeLeftShort(m.expires)} left${claim}</div>
+    <div class="post-row-meta">${pinBadge}#${m.id} · ${esc(m.type)} · ${esc(m.author)} · ${timeLeftShort(m.expires)} left${claim}</div>
     <div class="post-row-text">${esc(m.text)}</div>
   </div>
-  <button class="btn danger" onclick="deletePost(${m.id})">Delete</button>
-</div>`; }).join('') + '</div>';
+  <div class="post-row-actions">
+    ${pinBtn}
+    <button class="btn danger" onclick="deletePost(${m.id})">Delete</button>
+  </div>
+</div>`;
+      }).join('') + '</div>';
   } catch (_) {
     container.innerHTML = '<div class="post-empty">Failed to load posts.</div>';
   }
 }
+
 async function deletePost(id) {
   if (!confirm('Delete this post?')) return;
   const r = await apiFetch(api('/admin/delete/post') + '&id=' + id);
   if (r.ok) {
     const row = document.getElementById('pr-' + id);
     if (row) row.remove();
+    // If we just deleted the pinned post, the server cleared the pin too.
+    if (id === adminPinnedId) {
+      adminPinnedId = 0;
+      renderPinnedStatus();
+    }
     fb('postListFb', '✓ Post deleted');
   } else { fb('postListFb', '✗ Delete failed'); }
+}
+
+async function doPin(id) {
+  try {
+    const r = await apiFetch(api('/admin/pin') + '&id=' + id);
+    if (!r.ok) { fb('postListFb', '✗ Pin failed'); return; }
+    adminPinnedId = id;
+    renderPinnedStatus();
+    loadPostList();  // re-render to move the pinned card to the top
+    fb('postListFb', '✓ Pinned post #' + id);
+  } catch (_) { fb('postListFb', '✗ Pin failed'); }
+}
+
+async function doUnpin() {
+  try {
+    const r = await apiFetch(api('/admin/unpin'));
+    if (!r.ok) { fb('postListFb', '✗ Unpin failed'); return; }
+    adminPinnedId = 0;
+    renderPinnedStatus();
+    loadPostList();
+    fb('postListFb', '✓ Unpinned');
+  } catch (_) { fb('postListFb', '✗ Unpin failed'); }
+}
+
+// ── Stats ───────────────────────────────────────────────────────────────────
+// Renders the in-RAM activity counters and current state as a tile grid.
+function fmtBytes(b) {
+  if (b === undefined || b === null) return '—';
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function statTile(label, value, sub) {
+  return `<div class="stat-tile">
+    <span class="stat-label">${esc(label)}</span>
+    <span class="stat-value">${esc(String(value))}</span>
+    ${sub ? `<span class="stat-sub">${esc(sub)}</span>` : ''}
+  </div>`;
+}
+
+async function loadStats() {
+  const grid = document.getElementById('statsGrid');
+  if (!grid) return;
+  grid.innerHTML = '<div class="post-empty">Loading…</div>';
+  try {
+    const r = await apiFetch(api('/admin/stats'));
+    if (!r.ok) { grid.innerHTML = '<div class="post-empty">Failed to load stats.</div>'; return; }
+    const d = await r.json();
+    const t = d.by_type || {};
+    const heapPct = d.heap_size ? Math.round((1 - d.free_heap / d.heap_size) * 100) : 0;
+    const fsPct   = d.fs_total  ? Math.round((d.fs_used / d.fs_total) * 100) : 0;
+    grid.innerHTML =
+      statTile('Uptime',      d.uptime_str || '—') +
+      statTile('Neighbors',   d.wifi_clients ?? 0, 'connected now') +
+      statTile('Posts',       d.msg_count ?? 0,    (d.posts_total ?? 0) + ' since boot') +
+      statTile('Reactions',   d.reactions_total ?? 0, 'since boot') +
+      statTile('Claims',      d.claims_total ?? 0,    'since boot') +
+      statTile('Poll votes',  d.votes_total ?? 0,     'since boot') +
+      statTile('Waves',       d.waves_total ?? 0,     'since boot') +
+      statTile('Wall strokes',d.stroke_count ?? 0, (d.strokes_total ?? 0) + ' total drawn') +
+      statTile('Heap free',   fmtBytes(d.free_heap), heapPct + '% used · min ' + fmtBytes(d.min_free_heap)) +
+      statTile('Storage',     fmtBytes(d.fs_used), fsPct + '% of ' + fmtBytes(d.fs_total)) +
+      `<div class="stat-tile wide">
+        <span class="stat-label">Current posts by type</span>
+        <div class="stat-types">
+          <span>Notice <b>${t.notice ?? 0}</b></span>
+          <span>Offer <b>${t.offer ?? 0}</b></span>
+          <span>Need <b>${t.need ?? 0}</b></span>
+          <span>Event <b>${t.event ?? 0}</b></span>
+          <span>Poll <b>${t.poll ?? 0}</b></span>
+          <span>Claimed <b>${d.claimed ?? 0}</b></span>
+          <span>Expired <b>${d.expired ?? 0}</b></span>
+        </div>
+      </div>`;
+    fb('statsFb', 'updated ' + new Date().toLocaleTimeString());
+  } catch (_) {
+    grid.innerHTML = '<div class="post-empty">Failed to load stats.</div>';
+  }
 }
 
 function doOTA() {
@@ -1790,9 +2055,30 @@ function markWallSeen(id) {
 }
 
 // ── Opacity from age ────────────────────────────────────────────────────────
+// We compare stroke ages against the SERVER's clock, not the browser's.
+// The server stamps each /wall/data response with an X-Server-Now header
+// containing its current epoch. If the board's clock isn't set, that value
+// is "seconds since boot" rather than a real Unix epoch — without this
+// alignment, fresh strokes look like they're from 1970 and render invisibly.
+// Stored as an offset so it stays accurate as the browser clock ticks.
+let serverEpochOffsetSecs = 0;   // serverNowSec - clientNowSec at last sync
+let haveServerOffset      = false;
+
+function clientNowSec() { return Math.floor(Date.now() / 1000); }
+function serverNowSec() {
+  return haveServerOffset ? (clientNowSec() + serverEpochOffsetSecs)
+                          : clientNowSec();
+}
+function syncServerNow(secsString) {
+  if (!secsString) return;
+  const n = Number(secsString);
+  if (!isFinite(n)) return;
+  serverEpochOffsetSecs = n - clientNowSec();
+  haveServerOffset = true;
+}
+
 function opacityForAge(epochSecs) {
-  const nowSec = Math.floor(Date.now() / 1000);
-  const age = nowSec - epochSecs;
+  const age = serverNowSec() - epochSecs;
   if (age <= FADE_START_SECS) return 1.0;
   if (age >= FADE_END_SECS)   return 0;
   // Linear from 1.0 to 0.2 between day 7 and day 14
@@ -1961,9 +2247,13 @@ async function endStroke(evt) {
       fb('✗ Stroke rejected');
       return;
     }
+    syncServerNow(r.headers.get('X-Server-Now'));
     const data = await r.json();
+    // Use the server's own timestamp for the optimistic insert so the next
+    // renderAll cycle computes the same age the server would.
+    const tServer = (data && typeof data.t === 'number') ? data.t : serverNowSec();
     appendStroke({
-      id: data.id, t: Math.floor(Date.now() / 1000),
+      id: data.id, t: tServer,
       c: myColor, w: myBrush, p: currentPoints
     });
     myStrokeIds.push(data.id);
@@ -2004,6 +2294,7 @@ function undoMyLast() {
 async function loadWall() {
   try {
     const r = await fetch('/wall/data');
+    syncServerNow(r.headers.get('X-Server-Now'));
     strokes = await r.json();
     renderAll();
   } catch (_) {
@@ -2015,6 +2306,7 @@ async function pollNew() {
   if (document.hidden) return;
   try {
     const r = await fetch('/wall/data');
+    syncServerNow(r.headers.get('X-Server-Now'));
     const fresh = await r.json();
     // If anything new arrived, do a full re-render
     const lastFresh = fresh.length ? fresh[fresh.length - 1].id : 0;

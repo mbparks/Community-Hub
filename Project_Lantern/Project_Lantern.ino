@@ -28,6 +28,7 @@
 #include <time.h>
 #include <math.h>
 #include "Community_Hub_pages.h"
+#include "Community_Hub_pages_gz.h"
 
 
 // ===================== CONFIG ===================== //
@@ -221,6 +222,43 @@ void saveAdminKey() {
   LittleFS.rename("/adminkey.tmp", "/adminkey.json");
 }
 
+// ===================== PINNED POST =====================
+// Admin pins one post at a time to surface above the regular board. The pinned
+// post is exempt from normal expiry filtering so it doesn't disappear at 72h.
+// pinnedMsgId == 0 means nothing is pinned.
+uint16_t pinnedMsgId = 0;
+
+void savePinned() {
+  DynamicJsonDocument doc(64);
+  doc["id"] = pinnedMsgId;
+  File tmp = LittleFS.open("/pin.tmp", FILE_WRITE);
+  if (!tmp) return;
+  serializeJson(doc, tmp);
+  tmp.close();
+  LittleFS.remove("/pinned.json");
+  LittleFS.rename("/pin.tmp", "/pinned.json");
+}
+
+void loadPinned() {
+  if (!LittleFS.exists("/pinned.json")) return;
+  File f = LittleFS.open("/pinned.json");
+  if (!f) return;
+  DynamicJsonDocument doc(64);
+  if (!deserializeJson(doc, f)) {
+    pinnedMsgId = (uint16_t)(doc["id"] | 0);
+  }
+  f.close();
+}
+
+// Called from any path that deletes a message, so a stale pinnedMsgId never
+// outlives its target post.
+void clearPinIfMatches(uint16_t id) {
+  if (pinnedMsgId == id && id != 0) {
+    pinnedMsgId = 0;
+    savePinned();
+  }
+}
+
 void loadAdminKey() {
   if (!LittleFS.exists("/adminkey.json")) return;
   File f = LittleFS.open("/adminkey.json");
@@ -232,6 +270,17 @@ void loadAdminKey() {
   }
   f.close();
 }
+
+// ===================== RUNTIME STATS =====================
+// In-RAM counters, reset on reboot. Persisting them adds complexity for not
+// much value; the "since boot" framing matches the uptime field nicely.
+uint32_t stats_posts_total     = 0;
+uint32_t stats_reactions_total = 0;
+uint32_t stats_claims_total    = 0;
+uint32_t stats_votes_total     = 0;
+uint32_t stats_waves_total     = 0;
+uint32_t stats_strokes_total   = 0;
+
 
 // ===================== RUNTIME LED SETTINGS =====================
 int  led_day_brightness   = Config::LED_DAY_BRIGHTNESS;
@@ -351,33 +400,126 @@ String formatUptime() {
   return String(buf);
 }
 
+// ===================== MESSAGE TYPE ENUM =====================
+// Stored as a single byte in RAM instead of a String. Saves ~25 bytes per
+// message vs the old `String type` field. The wire/disk format keeps the
+// human-readable strings ("Notice", "Offer", ...) for compatibility.
+enum MsgType : uint8_t {
+  MSG_NOTICE = 0,
+  MSG_OFFER  = 1,
+  MSG_NEED   = 2,
+  MSG_EVENT  = 3,
+  MSG_POLL   = 4
+};
+
+const char* msgTypeToString(uint8_t t) {
+  switch (t) {
+    case MSG_OFFER: return "Offer";
+    case MSG_NEED:  return "Need";
+    case MSG_EVENT: return "Event";
+    case MSG_POLL:  return "Poll";
+    default:        return "Notice";
+  }
+}
+
+uint8_t stringToMsgType(const char* s) {
+  if (!s)                          return MSG_NOTICE;
+  if (strcmp(s, "Offer") == 0)     return MSG_OFFER;
+  if (strcmp(s, "Need")  == 0)     return MSG_NEED;
+  if (strcmp(s, "Event") == 0)     return MSG_EVENT;
+  if (strcmp(s, "Poll")  == 0)     return MSG_POLL;
+  return MSG_NOTICE;
+}
+
+uint8_t stringToMsgType(const String& s) { return stringToMsgType(s.c_str()); }
+
+// ===================== TOKEN HELPERS (binary) =====================
+// Per-message owner/claim tokens are 64 bits stored as 8 raw bytes in RAM
+// (vs the old 16-char hex String, which carried ~33 bytes of overhead each).
+// Converted to/from hex only at the wire boundary so the on-disk JSON and the
+// browser API stay unchanged.
+#define TOKEN_BYTES 8
+#define TOKEN_HEX_CHARS (TOKEN_BYTES * 2)
+
+void generateBinaryToken(uint8_t* out) {
+  uint32_t a = esp_random();
+  uint32_t b = esp_random();
+  out[0] = (a >> 24) & 0xFF; out[1] = (a >> 16) & 0xFF;
+  out[2] = (a >>  8) & 0xFF; out[3] =  a        & 0xFF;
+  out[4] = (b >> 24) & 0xFF; out[5] = (b >> 16) & 0xFF;
+  out[6] = (b >>  8) & 0xFF; out[7] =  b        & 0xFF;
+}
+
+String tokenToHex(const uint8_t* in) {
+  static const char hex[] = "0123456789abcdef";
+  char buf[TOKEN_HEX_CHARS + 1];
+  for (size_t i = 0; i < TOKEN_BYTES; i++) {
+    buf[2 * i]     = hex[(in[i] >> 4) & 0xF];
+    buf[2 * i + 1] = hex[ in[i]       & 0xF];
+  }
+  buf[TOKEN_HEX_CHARS] = '\0';
+  return String(buf);
+}
+
+// Returns true on success, fills `out` with 8 bytes. Returns false (and zeroes
+// `out`) on any malformed input, including null, wrong length, or non-hex
+// characters. Tolerant of mixed case.
+bool hexToToken(const char* hex, uint8_t* out) {
+  memset(out, 0, TOKEN_BYTES);
+  if (!hex) return false;
+  if (strlen(hex) != TOKEN_HEX_CHARS) return false;
+  auto nibble = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+  for (size_t i = 0; i < TOKEN_BYTES; i++) {
+    int hi = nibble(hex[2 * i]);
+    int lo = nibble(hex[2 * i + 1]);
+    if (hi < 0 || lo < 0) { memset(out, 0, TOKEN_BYTES); return false; }
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
+bool tokenIsZero(const uint8_t* t) {
+  for (size_t i = 0; i < TOKEN_BYTES; i++) if (t[i]) return false;
+  return true;
+}
+
+bool tokenEqualsHex(const uint8_t* t, const String& hex) {
+  if (hex.length() != TOKEN_HEX_CHARS) return false;
+  uint8_t cmp[TOKEN_BYTES];
+  if (!hexToToken(hex.c_str(), cmp)) return false;
+  return memcmp(t, cmp, TOKEN_BYTES) == 0;
+}
+
 // ===================== MESSAGES =====================
 struct Message {
   uint16_t      id;
-  String        author;
-  String        type;            // Notice | Offer | Need | Event | Poll
-  String        text;            // body for messages, question for polls
+  uint8_t       type;            // MsgType enum, was String
+  uint8_t       authorColor;     // palette index, 0 = default ink
   unsigned long expires;
 
+  String        author;
+  String        text;            // body for messages, question for polls
+
   // Ownership: minted on post, returned once to the creator's browser.
-  // Required for edit/delete. Never sent in /messages.
-  String        ownerToken;
+  // Required for edit/delete. Never sent in /messages. Zero = unowned.
+  uint8_t       ownerToken[TOKEN_BYTES];
 
   // Claim state (Offer/Need only):
   bool          claimed;
   String        claimedBy;
-  String        claimToken;      // minted on claim, returned once to the claimer.
-
-  // Poll-only fields (pollOptCount == 0 for non-polls):
-  uint8_t       pollOptCount;
-  String        pollOpts[4];
-  uint16_t      pollVotes[4];
+  uint8_t       claimToken[TOKEN_BYTES];  // valid only when `claimed`
 
   // Reactions: counters for [thanks, me_too, nice, noted]
   uint16_t      reactions[4];
 
-  // Author name color (index into the palette in the page JS, 0 = default ink)
-  uint8_t       authorColor;
+  // Poll fields live in a separate sparse pool (see PollData below). The vast
+  // majority of messages aren't polls, so embedding 4 Strings and an array
+  // per-message wasted ~14 KB across MAX_MSGS=200.
 };
 
 Message msgs[Config::MAX_MSGS];
@@ -388,8 +530,70 @@ unsigned long lastPostTime = 0;
 bool msgsDirty = false;
 unsigned long lastMsgDirtyTime = 0;
 
+// ===================== POLL POOL (sparse) =====================
+// Only allocated for messages that are actually polls. msgId==0 means the
+// slot is free. Worst case: every message is a poll up to MAX_POLLS, after
+// which new poll posts fail. 30 simultaneous polls is plenty for a
+// neighborhood board.
+#define MAX_POLLS 30
+
+struct PollData {
+  uint16_t msgId;      // 0 = free slot
+  uint8_t  optCount;   // 0..4
+  String   opts[4];
+  uint16_t votes[4];
+};
+
+PollData polls[MAX_POLLS];
+
+// Helpers return int indices (or -1) rather than PollData*, because the
+// Arduino IDE's prototype-injecting preprocessor puts auto-generated prototypes
+// above any user-defined struct, so a function whose return type or parameter
+// list mentions PollData would fail with "PollData does not name a type".
+// Same trick `addMessage` uses to avoid returning `Message`.
+
+// Returns index in polls[], or -1 if not found.
+int findPollIdx(uint16_t msgId) {
+  if (msgId == 0) return -1;
+  for (int i = 0; i < MAX_POLLS; i++) {
+    if (polls[i].msgId == msgId) return i;
+  }
+  return -1;
+}
+
+// Reserves a free slot for msgId. Returns slot index, or -1 if pool full.
+int allocPollIdx(uint16_t msgId) {
+  for (int i = 0; i < MAX_POLLS; i++) {
+    if (polls[i].msgId == 0) {
+      polls[i].msgId    = msgId;
+      polls[i].optCount = 0;
+      for (uint8_t k = 0; k < 4; k++) {
+        polls[i].opts[k]  = "";
+        polls[i].votes[k] = 0;
+      }
+      return i;
+    }
+  }
+  return -1;
+}
+
+void freePoll(uint16_t msgId) {
+  int idx = findPollIdx(msgId);
+  if (idx < 0) return;
+  polls[idx].msgId    = 0;
+  polls[idx].optCount = 0;
+  for (uint8_t k = 0; k < 4; k++) {
+    polls[idx].opts[k]  = "";
+    polls[idx].votes[k] = 0;
+  }
+}
+
 // Stream save: write each message as a small JSON doc directly to the file,
 // rather than building one giant 100KB+ doc in RAM. Friendly to ESP32 heap.
+//
+// On-disk format is unchanged from before the struct refactor: type stays as a
+// human-readable string, tokens stay as 16-char hex. Old /msgs.json files load
+// cleanly; new files load cleanly on old firmware too.
 void saveMessages() {
   File tmp = LittleFS.open("/msgs.tmp", FILE_WRITE);
   if (!tmp) return;
@@ -399,21 +603,26 @@ void saveMessages() {
     DynamicJsonDocument o(2048);
     o["id"]         = msgs[i].id;
     o["author"]     = msgs[i].author;
-    o["type"]       = msgs[i].type;
+    o["type"]       = msgTypeToString(msgs[i].type);
     o["text"]       = msgs[i].text;
     o["expires"]    = msgs[i].expires;
-    o["ownerToken"] = msgs[i].ownerToken;
+    if (!tokenIsZero(msgs[i].ownerToken)) {
+      o["ownerToken"] = tokenToHex(msgs[i].ownerToken);
+    }
     if (msgs[i].claimed) {
       o["claimed"]    = true;
       o["claimedBy"]  = msgs[i].claimedBy;
-      o["claimToken"] = msgs[i].claimToken;
+      o["claimToken"] = tokenToHex(msgs[i].claimToken);
     }
-    if (msgs[i].pollOptCount > 0) {
-      JsonArray opts  = o.createNestedArray("options");
-      JsonArray votes = o.createNestedArray("votes");
-      for (uint8_t k = 0; k < msgs[i].pollOptCount; k++) {
-        opts.add(msgs[i].pollOpts[k]);
-        votes.add(msgs[i].pollVotes[k]);
+    if (msgs[i].type == MSG_POLL) {
+      int pidx = findPollIdx(msgs[i].id);
+      if (pidx >= 0 && polls[pidx].optCount > 0) {
+        JsonArray opts  = o.createNestedArray("options");
+        JsonArray votes = o.createNestedArray("votes");
+        for (uint8_t k = 0; k < polls[pidx].optCount; k++) {
+          opts.add(polls[pidx].opts[k]);
+          votes.add(polls[pidx].votes[k]);
+        }
       }
     }
     // Only emit reactions array if any are non-zero (saves space)
@@ -447,38 +656,44 @@ void loadMessages() {
   msgCount = 0;
   for (JsonObject o : arr) {
     if (msgCount >= Config::MAX_MSGS) break;
-    msgs[msgCount].id         = o["id"] | nextMsgId;
-    msgs[msgCount].author     = (const char*)o["author"];
-    msgs[msgCount].type       = (const char*)o["type"];
-    msgs[msgCount].text       = (const char*)o["text"];
-    msgs[msgCount].expires    = o["expires"];
-    msgs[msgCount].ownerToken = (const char*)(o["ownerToken"] | "");
-    msgs[msgCount].claimed    = o["claimed"]    | false;
-    msgs[msgCount].claimedBy  = (const char*)(o["claimedBy"]  | "");
-    msgs[msgCount].claimToken = (const char*)(o["claimToken"] | "");
-    msgs[msgCount].pollOptCount = 0;
-    JsonArray opts  = o["options"];
-    JsonArray votes = o["votes"];
-    if (!opts.isNull()) {
-      uint8_t k = 0;
-      for (JsonVariant v : opts) {
-        if (k >= 4) break;
-        msgs[msgCount].pollOpts[k] = v.as<String>();
-        msgs[msgCount].pollVotes[k] = votes.isNull() ? 0 : (uint16_t)(votes[k] | 0);
-        k++;
-      }
-      msgs[msgCount].pollOptCount = k;
-    }
-    // Reactions and author color (default to zero if missing from old files)
-    for (uint8_t k = 0; k < 4; k++) msgs[msgCount].reactions[k] = 0;
+    Message& m = msgs[msgCount];
+    m.id          = o["id"] | nextMsgId;
+    m.author      = (const char*)(o["author"] | "");
+    m.type        = stringToMsgType((const char*)(o["type"] | "Notice"));
+    m.text        = (const char*)(o["text"] | "");
+    m.expires     = o["expires"];
+    hexToToken(o["ownerToken"] | "", m.ownerToken);  // zeros on missing/invalid
+    m.claimed     = o["claimed"] | false;
+    m.claimedBy   = (const char*)(o["claimedBy"] | "");
+    hexToToken(o["claimToken"] | "", m.claimToken);
+    for (uint8_t k = 0; k < 4; k++) m.reactions[k] = 0;
     JsonArray rxn = o["reactions"];
     if (!rxn.isNull()) {
       for (uint8_t k = 0; k < 4 && k < rxn.size(); k++) {
-        msgs[msgCount].reactions[k] = (uint16_t)(rxn[k] | 0);
+        m.reactions[k] = (uint16_t)(rxn[k] | 0);
       }
     }
-    msgs[msgCount].authorColor = (uint8_t)(o["authorColor"] | 0);
-    if (msgs[msgCount].id >= nextMsgId) nextMsgId = msgs[msgCount].id + 1;
+    m.authorColor = (uint8_t)(o["authorColor"] | 0);
+
+    // Polls go into the sparse pool keyed by message id. If the pool is full,
+    // the message survives but loses its options; it'll behave like a Notice.
+    JsonArray opts  = o["options"];
+    JsonArray votes = o["votes"];
+    if (!opts.isNull() && m.type == MSG_POLL) {
+      int pidx = allocPollIdx(m.id);
+      if (pidx >= 0) {
+        uint8_t k = 0;
+        for (JsonVariant v : opts) {
+          if (k >= 4) break;
+          polls[pidx].opts[k]  = v.as<String>();
+          polls[pidx].votes[k] = votes.isNull() ? 0 : (uint16_t)(votes[k] | 0);
+          k++;
+        }
+        polls[pidx].optCount = k;
+      }
+    }
+
+    if (m.id >= nextMsgId) nextMsgId = m.id + 1;
     msgCount++;
   }
   f.close();
@@ -487,13 +702,16 @@ void loadMessages() {
 // addMessage uses output references rather than returning a struct, so the
 // Arduino IDE's prototype-injecting preprocessor doesn't trip over an unknown
 // user-defined return type (it injects prototypes above struct definitions).
-// Returns true on success, false if the board is genuinely full.
-// On success, outId and outToken receive the new post's id and owner token.
+// Returns true on success, false if the board is genuinely full (or the poll
+// pool is exhausted for a Poll post).
+// On success, outId and outToken receive the new post's id and owner token (hex).
 bool addMessage(String author, String type, String text, int expiryHours,
                 uint8_t pollCount, String* pollOpts, uint8_t authorColor,
                 uint16_t& outId, String& outToken) {
   outId = 0;
   outToken = "";
+
+  uint8_t typeEnum = stringToMsgType(type);
 
   if (msgCount >= Config::MAX_MSGS) {
     unsigned long now = nowSecs();
@@ -506,33 +724,49 @@ bool addMessage(String author, String type, String text, int expiryHours,
       }
     }
     if (evict < 0) return false;  // genuinely full
+    // If we're evicting a poll, return its slot to the pool.
+    if (msgs[evict].type == MSG_POLL) freePoll(msgs[evict].id);
+    clearPinIfMatches(msgs[evict].id);
     for (int i = evict; i < msgCount - 1; i++) msgs[i] = msgs[i + 1];
     msgCount--;
   }
 
   int i = msgCount;
-  msgs[i].id           = nextMsgId++;
+  uint16_t newId = nextMsgId++;
+
+  // For polls, claim a slot in the sparse pool first. If the pool is full,
+  // fail cleanly without partially constructing the message.
+  if (typeEnum == MSG_POLL) {
+    int pidx = allocPollIdx(newId);
+    if (pidx < 0) {
+      nextMsgId--;  // give the id back since we're not using it
+      return false;
+    }
+    for (uint8_t k = 0; k < pollCount && k < 4; k++) {
+      polls[pidx].opts[k]  = pollOpts[k];
+      polls[pidx].votes[k] = 0;
+    }
+    polls[pidx].optCount = (pollCount > 4) ? 4 : pollCount;
+  }
+
+  msgs[i].id           = newId;
   msgs[i].author       = author;
-  msgs[i].type         = type;
+  msgs[i].type         = typeEnum;
   msgs[i].text         = text;
   msgs[i].expires      = nowSecs() + (unsigned long)expiryHours * 3600UL;
-  msgs[i].ownerToken   = generateShortToken();
+  generateBinaryToken(msgs[i].ownerToken);
   msgs[i].claimed      = false;
   msgs[i].claimedBy    = "";
-  msgs[i].claimToken   = "";
-  msgs[i].pollOptCount = pollCount;
-  for (uint8_t k = 0; k < pollCount && k < 4; k++) {
-    msgs[i].pollOpts[k]  = pollOpts[k];
-    msgs[i].pollVotes[k] = 0;
-  }
+  memset(msgs[i].claimToken, 0, TOKEN_BYTES);
   for (uint8_t k = 0; k < 4; k++) msgs[i].reactions[k] = 0;
   msgs[i].authorColor  = authorColor;
 
   outId    = msgs[i].id;
-  outToken = msgs[i].ownerToken;
+  outToken = tokenToHex(msgs[i].ownerToken);
 
   msgCount++;
   lastPostTime = nowSecs();
+  stats_posts_total++;
   if (!msgsDirty) { msgsDirty = true; lastMsgDirtyTime = millis(); }
   return true;
 }
@@ -637,9 +871,24 @@ String validateType(const String& t) {
   return "Notice";
 }
 
-void handleRoot()  { server.send_P(200, "text/html; charset=utf-8", INDEX_HTML); }
+// The main board and wall pages are served pre-gzipped from
+// Community_Hub_pages_gz.h. Browsers decompress transparently via the
+// Content-Encoding: gzip header. Cuts the main page from ~41 KB to ~10 KB.
+//
+// The admin page is built dynamically (HEAD + injected JS + TAIL) and stays
+// uncompressed. It's only loaded by the host occasionally; not worth the
+// extra plumbing to gzip a dynamic response.
+void handleRoot() {
+  server.sendHeader("Content-Encoding", "gzip");
+  server.send_P(200, "text/html; charset=utf-8",
+                (PGM_P)INDEX_HTML_GZ, INDEX_HTML_GZ_LEN);
+}
 void handleAdmin() { server.send(200, "text/html; charset=utf-8", buildAdminPage()); }
-void handleWall()  { server.send_P(200, "text/html; charset=utf-8", WALL_HTML); }
+void handleWall() {
+  server.sendHeader("Content-Encoding", "gzip");
+  server.send_P(200, "text/html; charset=utf-8",
+                (PGM_P)WALL_HTML_GZ, WALL_HTML_GZ_LEN);
+}
 
 void handleAdminAuth() {
   DynamicJsonDocument doc(256);
@@ -665,22 +914,38 @@ void handleInfo() {
   doc["footer"]   = id_footer;
   doc["hostname"] = effectiveHostname();
   doc["uptime"]   = formatUptime();
+  doc["pinned"]   = pinnedMsgId;   // 0 = nothing pinned
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
 // Public messages feed. NEVER includes ownerToken or claimToken.
+//
+// Streams the response chunk-by-chunk via sendContent() so we never hold the
+// full payload in RAM. Each message is built in its own ~1 KB JsonDocument and
+// flushed; peak transient RAM stays around 1-2 KB regardless of board size.
+// Replaces the old approach of a single 20 KB document.
 void handleMessages() {
-  DynamicJsonDocument doc(20480);
-  JsonArray arr = doc.to<JsonArray>();
   unsigned long now = nowSecs();
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");  // headers only
+
+  String chunk;
+  chunk.reserve(1536);
+  chunk = "[";
+  bool first = true;
+
   for (int i = 0; i < msgCount; i++) {
-    if (msgs[i].expires < now) continue;
-    JsonObject o = arr.createNestedObject();
+    // Pinned posts are exempt from the normal expiry filter; they live until
+    // explicitly unpinned, deleted, or evicted.
+    if (msgs[i].expires < now && msgs[i].id != pinnedMsgId) continue;
+
+    DynamicJsonDocument o(1024);
     o["id"]      = msgs[i].id;
     o["author"]  = msgs[i].author;
-    o["type"]    = msgs[i].type;
+    o["type"]    = msgTypeToString(msgs[i].type);
     o["text"]    = msgs[i].text;
     o["expires"] = msgs[i].expires;
     if (msgs[i].authorColor > 0) o["authorColor"] = msgs[i].authorColor;
@@ -688,21 +953,36 @@ void handleMessages() {
       o["claimed"]   = true;
       o["claimedBy"] = msgs[i].claimedBy;
     }
-    if (msgs[i].pollOptCount > 0) {
-      JsonArray opts  = o.createNestedArray("options");
-      JsonArray votes = o.createNestedArray("votes");
-      for (uint8_t k = 0; k < msgs[i].pollOptCount; k++) {
-        opts.add(msgs[i].pollOpts[k]);
-        votes.add(msgs[i].pollVotes[k]);
+    if (msgs[i].type == MSG_POLL) {
+      int pidx = findPollIdx(msgs[i].id);
+      if (pidx >= 0 && polls[pidx].optCount > 0) {
+        JsonArray opts  = o.createNestedArray("options");
+        JsonArray votes = o.createNestedArray("votes");
+        for (uint8_t k = 0; k < polls[pidx].optCount; k++) {
+          opts.add(polls[pidx].opts[k]);
+          votes.add(polls[pidx].votes[k]);
+        }
       }
     }
     // Always emit reactions array so client doesn't have to check (4 small ints).
     JsonArray rxn = o.createNestedArray("reactions");
     for (uint8_t k = 0; k < 4; k++) rxn.add(msgs[i].reactions[k]);
+
+    String body;
+    serializeJson(o, body);
+    if (!first) chunk += ",";
+    chunk += body;
+    first = false;
+
+    // Flush every ~1 KB so transient memory stays small.
+    if (chunk.length() > 1024) {
+      server.sendContent(chunk);
+      chunk = "";
+    }
   }
-  String out;
-  serializeJson(doc, out);
-  server.send(200, "application/json", out);
+  chunk += "]";
+  server.sendContent(chunk);
+  server.sendContent("");  // empty chunk signals end of response
 }
 
 void handlePost() {
@@ -764,7 +1044,8 @@ void handlePostEdit() {
   String   text  = sanitize(doc["text"] | "", 300);
   int idx = findMessageIdx(id);
   if (idx < 0)                                          { server.send(404, "text/plain", "not found"); return; }
-  if (token.length() == 0 || token != msgs[idx].ownerToken) {
+  if (tokenIsZero(msgs[idx].ownerToken) ||
+      !tokenEqualsHex(msgs[idx].ownerToken, token)) {
     server.send(403, "text/plain", "forbidden"); return;
   }
   if (text.isEmpty())                                   { server.send(400, "text/plain", "empty"); return; }
@@ -782,9 +1063,12 @@ void handlePostDelete() {
   String   token = doc["token"] | "";
   int idx = findMessageIdx(id);
   if (idx < 0)                                          { server.send(404, "text/plain", "not found"); return; }
-  if (token.length() == 0 || token != msgs[idx].ownerToken) {
+  if (tokenIsZero(msgs[idx].ownerToken) ||
+      !tokenEqualsHex(msgs[idx].ownerToken, token)) {
     server.send(403, "text/plain", "forbidden"); return;
   }
+  if (msgs[idx].type == MSG_POLL) freePoll(msgs[idx].id);
+  clearPinIfMatches(msgs[idx].id);
   for (int j = idx; j < msgCount - 1; j++) msgs[j] = msgs[j + 1];
   msgCount--;
   if (!msgsDirty) { msgsDirty = true; lastMsgDirtyTime = millis(); }
@@ -801,18 +1085,19 @@ void handlePostClaim() {
   if (name.isEmpty()) name = "neighbor";
   int idx = findMessageIdx(id);
   if (idx < 0)                                          { server.send(404, "text/plain", "not found"); return; }
-  if (msgs[idx].type != "Offer" && msgs[idx].type != "Need") {
+  if (msgs[idx].type != MSG_OFFER && msgs[idx].type != MSG_NEED) {
     server.send(400, "text/plain", "not claimable"); return;
   }
   if (msgs[idx].claimed)                                { server.send(409, "text/plain", "already claimed"); return; }
 
-  msgs[idx].claimed    = true;
-  msgs[idx].claimedBy  = name;
-  msgs[idx].claimToken = generateShortToken();
+  msgs[idx].claimed   = true;
+  msgs[idx].claimedBy = name;
+  generateBinaryToken(msgs[idx].claimToken);
+  stats_claims_total++;
   if (!msgsDirty) { msgsDirty = true; lastMsgDirtyTime = millis(); }
 
   DynamicJsonDocument resp(256);
-  resp["token"] = msgs[idx].claimToken;
+  resp["token"] = tokenToHex(msgs[idx].claimToken);
   String out;
   serializeJson(resp, out);
   server.send(200, "application/json", out);
@@ -829,13 +1114,16 @@ void handlePostUnclaim() {
   if (idx < 0)                                          { server.send(404, "text/plain", "not found"); return; }
   if (!msgs[idx].claimed)                               { server.send(400, "text/plain", "not claimed"); return; }
   // Either the claim token or the owner token will do.
-  if (token.length() == 0 ||
-      (token != msgs[idx].claimToken && token != msgs[idx].ownerToken)) {
-    server.send(403, "text/plain", "forbidden"); return;
+  bool ok = false;
+  if (token.length() == TOKEN_HEX_CHARS) {
+    if (tokenEqualsHex(msgs[idx].claimToken, token)) ok = true;
+    else if (!tokenIsZero(msgs[idx].ownerToken) &&
+             tokenEqualsHex(msgs[idx].ownerToken, token)) ok = true;
   }
-  msgs[idx].claimed    = false;
-  msgs[idx].claimedBy  = "";
-  msgs[idx].claimToken = "";
+  if (!ok) { server.send(403, "text/plain", "forbidden"); return; }
+  msgs[idx].claimed   = false;
+  msgs[idx].claimedBy = "";
+  memset(msgs[idx].claimToken, 0, TOKEN_BYTES);
   if (!msgsDirty) { msgsDirty = true; lastMsgDirtyTime = millis(); }
   server.send(200, "text/plain", "ok");
 }
@@ -849,10 +1137,13 @@ void handlePollVote() {
   int      option = doc["option"] | -1;
   int idx = findMessageIdx(id);
   if (idx < 0)                                          { server.send(404, "text/plain", "not found"); return; }
-  if (msgs[idx].type != "Poll")                         { server.send(400, "text/plain", "not a poll"); return; }
-  if (option < 0 || option >= msgs[idx].pollOptCount)   { server.send(400, "text/plain", "bad option"); return; }
+  if (msgs[idx].type != MSG_POLL)                       { server.send(400, "text/plain", "not a poll"); return; }
+  int pidx = findPollIdx(id);
+  if (pidx < 0)                                         { server.send(404, "text/plain", "poll data missing"); return; }
+  if (option < 0 || option >= polls[pidx].optCount)     { server.send(400, "text/plain", "bad option"); return; }
   // Cap at uint16 max just in case the poll goes viral in the neighborhood.
-  if (msgs[idx].pollVotes[option] < 0xFFFF) msgs[idx].pollVotes[option]++;
+  if (polls[pidx].votes[option] < 0xFFFF) polls[pidx].votes[option]++;
+  stats_votes_total++;
   if (!msgsDirty) { msgsDirty = true; lastMsgDirtyTime = millis(); }
   server.send(200, "text/plain", "ok");
 }
@@ -872,6 +1163,7 @@ void handlePostReact() {
   if (idx < 0)                  { server.send(404, "text/plain", "not found"); return; }
   if (type < 0 || type > 3)     { server.send(400, "text/plain", "bad type"); return; }
   if (msgs[idx].reactions[type] < 0xFFFF) msgs[idx].reactions[type]++;
+  stats_reactions_total++;
   if (!msgsDirty) { msgsDirty = true; lastMsgDirtyTime = millis(); }
   server.send(200, "text/plain", "ok");
 }
@@ -929,6 +1221,7 @@ void handleWavePost() {
   waves[waveCount].icon      = icon;
   waves[waveCount].from      = from;
   waveCount++;
+  stats_waves_total++;
 
   DynamicJsonDocument resp(64);
   resp["id"] = waves[waveCount - 1].id;
@@ -996,12 +1289,21 @@ unsigned long lastWallDirtyTime = 0;
 
 // Drop strokes older than WALL_LIFETIME_SECS. Called before reading, writing,
 // or persisting. Shifts remaining strokes down to fill gaps.
+//
+// Underflow guard: if the admin sets the board's clock AFTER strokes were
+// drawn (createdEpoch is "seconds since boot", then nowSecs() jumps to a real
+// Unix epoch), createdEpoch > now and the unsigned subtraction wraps to
+// billions of seconds. Without the guard, every stroke gets pruned. We treat
+// strokes from "the future" as fresh (age=0) instead.
 void pruneStrokes() {
   if (!strokes) return;
   unsigned long now = nowSecs();
   int keep = 0;
   for (int i = 0; i < strokeCount; i++) {
-    if (now - strokes[i].createdEpoch <= WALL_LIFETIME_SECS) {
+    unsigned long age = (now > strokes[i].createdEpoch)
+                          ? (now - strokes[i].createdEpoch)
+                          : 0;
+    if (age <= WALL_LIFETIME_SECS) {
       if (keep != i) strokes[keep] = strokes[i];
       keep++;
     }
@@ -1084,17 +1386,21 @@ void loadWall() {
 // Stream-serializes directly to the response to avoid building a 50+ KB
 // JsonDocument in RAM. Uses chunked transfer encoding via sendContent().
 //
+// Emits X-Server-Now (board's current nowSecs()) so the browser can compute
+// stroke ages against server time, not its own clock. Otherwise, on a board
+// where the admin hasn't set the time, fresh strokes look ~54 years old to
+// the browser and render at opacity 0 ("blank wall" bug).
+//
 // Note: server.send(200, type, "") with an empty body finalizes the response;
 // subsequent writes are ignored. We must call send() with the headers, then
 // use sendContent() repeatedly to stream the body.
 void handleWallGet() {
   pruneStrokes();
 
-  // Build the body in chunks. Each loop iteration accumulates a small string
-  // and flushes it. Keeping the buffer small avoids large RAM spikes.
   String chunk;
   chunk.reserve(512);
 
+  server.sendHeader("X-Server-Now", String(nowSecs()));
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");  // headers only
 
@@ -1172,13 +1478,21 @@ void handleWallStroke() {
   }
   s.pointCount = pairs;
   strokeCount++;
+  stats_strokes_total++;
 
   if (!wallDirty) { wallDirty = true; lastWallDirtyTime = millis(); }
 
-  DynamicJsonDocument resp(64);
+  // Return the server's time for this stroke so the optimistic client-side
+  // entry uses the same reference frame as future /wall/data fetches. Without
+  // this, the optimistic entry would carry a client-Date.now() timestamp that
+  // disagrees with the server's, and the stroke would fade to opacity 0 on the
+  // next renderAll cycle.
+  DynamicJsonDocument resp(96);
   resp["id"] = s.id;
+  resp["t"]  = s.createdEpoch;
   String out;
   serializeJson(resp, out);
+  server.sendHeader("X-Server-Now", String(nowSecs()));
   server.send(200, "application/json", out);
 }
 
@@ -1195,6 +1509,7 @@ void handleWallInfo() {
   doc["count"]  = strokeCount;
   String out;
   serializeJson(doc, out);
+  server.sendHeader("X-Server-Now", String(nowSecs()));
   server.send(200, "application/json", out);
 }
 
@@ -1230,7 +1545,7 @@ void handleHealth() {
   unsigned long now = nowSecs();
   for (int i = 0; i < msgCount; i++) {
     if (msgs[i].claimed)          claimedCount++;
-    if (msgs[i].pollOptCount > 0) pollCount++;
+    if (msgs[i].type == MSG_POLL) pollCount++;
     if (msgs[i].expires < now)    expiredCount++;
   }
   doc["claimed_count"] = claimedCount;
@@ -1369,40 +1684,51 @@ void handleAdminRestore() {
     server.send(400, "text/plain", "bad json");
     return;
   }
+  // Wipe the poll pool too, since we're replacing the entire message set.
+  for (int i = 0; i < MAX_POLLS; i++) freePoll(polls[i].msgId);
+  // The pinned message id may not exist in the new set; clear it. Admin can
+  // re-pin from the restored posts if needed.
+  pinnedMsgId = 0;
+  savePinned();
   msgCount = 0;
   for (JsonObject o : doc.as<JsonArray>()) {
     if (msgCount >= Config::MAX_MSGS) break;
-    msgs[msgCount].id           = o["id"] | nextMsgId;
-    msgs[msgCount].author       = (const char*)o["author"];
-    msgs[msgCount].type         = (const char*)o["type"];
-    msgs[msgCount].text         = (const char*)o["text"];
-    msgs[msgCount].expires      = o["expires"];
-    msgs[msgCount].ownerToken   = (const char*)(o["ownerToken"] | "");
-    msgs[msgCount].claimed      = o["claimed"]    | false;
-    msgs[msgCount].claimedBy    = (const char*)(o["claimedBy"]  | "");
-    msgs[msgCount].claimToken   = (const char*)(o["claimToken"] | "");
-    msgs[msgCount].pollOptCount = 0;
-    JsonArray opts  = o["options"];
-    JsonArray votes = o["votes"];
-    if (!opts.isNull()) {
-      uint8_t k = 0;
-      for (JsonVariant v : opts) {
-        if (k >= 4) break;
-        msgs[msgCount].pollOpts[k]  = v.as<String>();
-        msgs[msgCount].pollVotes[k] = votes.isNull() ? 0 : (uint16_t)(votes[k] | 0);
-        k++;
-      }
-      msgs[msgCount].pollOptCount = k;
-    }
-    for (uint8_t k = 0; k < 4; k++) msgs[msgCount].reactions[k] = 0;
+    Message& m = msgs[msgCount];
+    m.id          = o["id"] | nextMsgId;
+    m.author      = (const char*)(o["author"] | "");
+    m.type        = stringToMsgType((const char*)(o["type"] | "Notice"));
+    m.text        = (const char*)(o["text"] | "");
+    m.expires     = o["expires"];
+    hexToToken(o["ownerToken"] | "", m.ownerToken);
+    m.claimed     = o["claimed"] | false;
+    m.claimedBy   = (const char*)(o["claimedBy"] | "");
+    hexToToken(o["claimToken"] | "", m.claimToken);
+    for (uint8_t k = 0; k < 4; k++) m.reactions[k] = 0;
     JsonArray rxn = o["reactions"];
     if (!rxn.isNull()) {
       for (uint8_t k = 0; k < 4 && k < rxn.size(); k++) {
-        msgs[msgCount].reactions[k] = (uint16_t)(rxn[k] | 0);
+        m.reactions[k] = (uint16_t)(rxn[k] | 0);
       }
     }
-    msgs[msgCount].authorColor = (uint8_t)(o["authorColor"] | 0);
-    if (msgs[msgCount].id >= nextMsgId) nextMsgId = msgs[msgCount].id + 1;
+    m.authorColor = (uint8_t)(o["authorColor"] | 0);
+
+    JsonArray opts  = o["options"];
+    JsonArray votes = o["votes"];
+    if (!opts.isNull() && m.type == MSG_POLL) {
+      int pidx = allocPollIdx(m.id);
+      if (pidx >= 0) {
+        uint8_t k = 0;
+        for (JsonVariant v : opts) {
+          if (k >= 4) break;
+          polls[pidx].opts[k]  = v.as<String>();
+          polls[pidx].votes[k] = votes.isNull() ? 0 : (uint16_t)(votes[k] | 0);
+          k++;
+        }
+        polls[pidx].optCount = k;
+      }
+    }
+
+    if (m.id >= nextMsgId) nextMsgId = m.id + 1;
     msgCount++;
   }
   saveMessages();
@@ -1460,14 +1786,96 @@ void handleAdminDeletePost() {
   uint16_t targetId = (uint16_t)server.arg("id").toInt();
   int idx = findMessageIdx(targetId);
   if (idx < 0) { server.send(404, "text/plain", "not found"); return; }
+  if (msgs[idx].type == MSG_POLL) freePoll(msgs[idx].id);
+  clearPinIfMatches(msgs[idx].id);
   for (int j = idx; j < msgCount - 1; j++) msgs[j] = msgs[j + 1];
   msgCount--;
   if (!msgsDirty) { msgsDirty = true; lastMsgDirtyTime = millis(); }
   server.send(200, "text/plain", "deleted");
 }
 
+// ── Pinned post ──────────────────────────────────────────────────────────────
+void handleAdminPin() {
+  if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
+  if (!server.hasArg("id")) { server.send(400, "text/plain", "missing id"); return; }
+  uint16_t target = (uint16_t)server.arg("id").toInt();
+  if (target == 0)          { server.send(400, "text/plain", "bad id"); return; }
+  if (findMessageIdx(target) < 0) {
+    server.send(404, "text/plain", "no such post");
+    return;
+  }
+  pinnedMsgId = target;
+  savePinned();
+  server.send(200, "text/plain", "pinned");
+}
+
+void handleAdminUnpin() {
+  if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
+  pinnedMsgId = 0;
+  savePinned();
+  server.send(200, "text/plain", "unpinned");
+}
+
+// ── Stats endpoint ───────────────────────────────────────────────────────────
+// Superset of /api/health, with the in-RAM counters and a type breakdown.
+// Auth-gated so cumulative activity isn't visible to general clients.
+void handleAdminStats() {
+  if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
+  DynamicJsonDocument doc(1024);
+
+  // Counters since boot
+  doc["posts_total"]     = stats_posts_total;
+  doc["reactions_total"] = stats_reactions_total;
+  doc["claims_total"]    = stats_claims_total;
+  doc["votes_total"]     = stats_votes_total;
+  doc["waves_total"]     = stats_waves_total;
+  doc["strokes_total"]   = stats_strokes_total;
+
+  // Current state
+  doc["msg_count"]   = msgCount;
+  doc["max_msgs"]    = Config::MAX_MSGS;
+  doc["stroke_count"] = strokeCount;
+  doc["max_strokes"] = MAX_STROKES;
+  doc["pinned"]      = pinnedMsgId;
+
+  // Type breakdown (current, not cumulative)
+  unsigned long now = nowSecs();
+  int byType[5] = {0, 0, 0, 0, 0};
+  int claimedCount = 0, expiredCount = 0;
+  for (int i = 0; i < msgCount; i++) {
+    if (msgs[i].type < 5) byType[msgs[i].type]++;
+    if (msgs[i].claimed)  claimedCount++;
+    if (msgs[i].expires < now && msgs[i].id != pinnedMsgId) expiredCount++;
+  }
+  JsonObject t = doc.createNestedObject("by_type");
+  t["notice"] = byType[MSG_NOTICE];
+  t["offer"]  = byType[MSG_OFFER];
+  t["need"]   = byType[MSG_NEED];
+  t["event"]  = byType[MSG_EVENT];
+  t["poll"]   = byType[MSG_POLL];
+  doc["claimed"] = claimedCount;
+  doc["expired"] = expiredCount;
+
+  // System
+  doc["free_heap"]     = ESP.getFreeHeap();
+  doc["min_free_heap"] = ESP.getMinFreeHeap();
+  doc["heap_size"]     = ESP.getHeapSize();
+  doc["fs_used"]       = LittleFS.usedBytes();
+  doc["fs_total"]      = LittleFS.totalBytes();
+  doc["wifi_clients"]  = WiFi.softAPgetStationNum();
+  doc["uptime_secs"]   = (millis() - bootMillis) / 1000;
+  doc["uptime_str"]    = formatUptime();
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
 void handleAdminClear() {
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
+  for (int i = 0; i < MAX_POLLS; i++) freePoll(polls[i].msgId);
+  pinnedMsgId = 0;
+  savePinned();
   msgCount = 0;
   saveMessages();
   server.send(200, "text/plain", "cleared");
@@ -1526,6 +1934,7 @@ void setup() {
     loadLedConfig();
     loadAdminKey();
     loadIdentityConfig();
+    loadPinned();
     loadMessages();
     if (strokes) loadWall();  // skip wall load if allocation failed
     Serial.printf("  Loaded %d message(s), %d stroke(s).\n", msgCount, strokeCount);
@@ -1603,6 +2012,9 @@ void setup() {
   server.on("/admin/clear",         handleAdminClear);
   server.on("/admin/wall/clear",    handleAdminWallClear);
   server.on("/admin/delete/post",   handleAdminDeletePost);
+  server.on("/admin/pin",           handleAdminPin);
+  server.on("/admin/unpin",         handleAdminUnpin);
+  server.on("/admin/stats",         handleAdminStats);
 
   server.onNotFound([]() { server.sendHeader("Location", "/"); server.send(302); });
 
