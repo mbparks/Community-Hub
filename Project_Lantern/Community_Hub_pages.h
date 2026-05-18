@@ -27,6 +27,15 @@ const char INDEX_HTML[] PROGMEM = R"PAGE(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Community Hub</title>
 <style>
+
+/* iOS: ensure single-tap delivery on interactive elements. Without this, on
+   iPhone/iPad some links/buttons require two taps to fire because the first
+   gets consumed by gesture detection (especially when an ancestor uses
+   touch-action: none, or :active applies a transform). */
+a, button {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
 :root {
   --bg:            #ede8de;
   --surface:       #faf8f3;
@@ -102,7 +111,7 @@ body {
   color: var(--ink-muted); cursor: pointer; font-size: 11px; padding: 5px 10px;
   transition: all .15s; white-space: nowrap; font-family: inherit;
 }
-.cat-btn:hover { border-color: var(--border); color: var(--ink); background: var(--surface2); }
+@media (hover: hover) and (pointer: fine) { .cat-btn:hover { border-color: var(--border); color: var(--ink); background: var(--surface2); } }
 .cat-btn.active-Notice { background: var(--c-notice-bg); border-color: var(--c-notice-bar); color: var(--c-notice-fg); font-weight: bold; }
 .cat-btn.active-Offer  { background: var(--c-offer-bg);  border-color: var(--c-offer-bar);  color: var(--c-offer-fg);  font-weight: bold; }
 .cat-btn.active-Need   { background: var(--c-need-bg);   border-color: var(--c-need-bar);   color: var(--c-need-fg);   font-weight: bold; }
@@ -128,7 +137,7 @@ body {
   color: var(--ink-muted); cursor: pointer; font-size: 11px; padding: 3px 11px;
   transition: all .15s; font-family: inherit;
 }
-.exp-btn:hover  { border-color: var(--border); color: var(--ink); }
+@media (hover: hover) and (pointer: fine) { .exp-btn:hover  { border-color: var(--border); color: var(--ink); } }
 .exp-btn.active { background: var(--accent-dark); border-color: var(--accent-dark); color: var(--accent-light); }
 
 .post-btn {
@@ -137,7 +146,7 @@ body {
   letter-spacing: 1px; padding: 8px 20px; margin-top: 8px; transition: background .15s;
   white-space: nowrap; align-self: flex-end; font-family: inherit;
 }
-.post-btn:hover { background: #3d6438; }
+@media (hover: hover) and (pointer: fine) { .post-btn:hover { background: #3d6438; } }
 
 /* Filter bar */
 .filter-bar {
@@ -151,7 +160,7 @@ body {
   color: var(--ink-muted); cursor: pointer; font-size: 11px; padding: 3px 12px;
   transition: all .15s; font-family: inherit;
 }
-.ftab:hover  { border-color: var(--accent-dark); color: var(--accent-dark); }
+@media (hover: hover) and (pointer: fine) { .ftab:hover  { border-color: var(--accent-dark); color: var(--accent-dark); } }
 .ftab.active { background: var(--accent-dark); border-color: var(--accent-dark); color: var(--accent-light); }
 
 /* Board */
@@ -231,8 +240,8 @@ body {
   color: var(--ink-muted); cursor: pointer; font-size: 11px; padding: 3px 10px;
   transition: all .15s; font-family: inherit;
 }
-.act-btn:hover { border-color: var(--accent-dark); color: var(--accent-dark); }
-.act-btn.danger:hover { border-color: #c0392b; color: #c0392b; }
+@media (hover: hover) and (pointer: fine) { .act-btn:hover { border-color: var(--accent-dark); color: var(--accent-dark); } }
+@media (hover: hover) and (pointer: fine) { .act-btn.danger:hover { border-color: #c0392b; color: #c0392b; } }
 
 /* Poll voting UI */
 .poll-options { display: flex; flex-direction: column; gap: 5px; margin-top: 9px; }
@@ -241,7 +250,7 @@ body {
   color: var(--c-poll-fg); cursor: pointer; font-size: 13px; padding: 7px 11px;
   text-align: left; transition: all .15s; font-family: inherit;
 }
-.poll-opt:hover { background: var(--c-poll-bg); }
+@media (hover: hover) and (pointer: fine) { .poll-opt:hover { background: var(--c-poll-bg); } }
 .poll-results { display: flex; flex-direction: column; gap: 6px; margin-top: 9px; }
 .poll-result {
   position: relative; background: var(--bg); border: 1px solid var(--border-light);
@@ -302,7 +311,7 @@ body[data-tint="night"]     { background-color: #d6d3cc; }
   border-radius: 99px; padding: 3px 11px; color: var(--accent-dark);
   cursor: pointer; font-size: 12px; font-family: inherit; transition: all .15s;
 }
-.wave-btn:hover  { background: var(--accent); }
+@media (hover: hover) and (pointer: fine) { .wave-btn:hover  { background: var(--accent); } }
 .wave-btn:active { transform: scale(0.93); }
 .wave-btn:disabled { opacity: 0.5; cursor: default; }
 
@@ -333,7 +342,7 @@ body[data-tint="night"]     { background-color: #d6d3cc; }
   color: var(--ink-muted); cursor: pointer; transition: all .15s;
   font-family: inherit; line-height: 1.4;
 }
-.rxn:hover { border-color: var(--accent-dark); }
+@media (hover: hover) and (pointer: fine) { .rxn:hover { border-color: var(--accent-dark); } }
 .rxn.did   { background: var(--accent-light); border-color: var(--accent-dark); color: var(--accent-dark); }
 .rxn .count { font-size: 11px; margin-left: 2px; }
 
@@ -351,7 +360,7 @@ body[data-tint="night"]     { background-color: #d6d3cc; }
   border: 2px solid transparent; transition: transform .15s;
   display: inline-block;
 }
-.color-swatch:hover  { transform: scale(1.15); }
+@media (hover: hover) and (pointer: fine) { .color-swatch:hover  { transform: scale(1.15); } }
 .color-swatch.active { border-color: var(--ink); }
 
 /* Author name color override (set inline via style attribute on the span) */
@@ -1063,6 +1072,15 @@ const char ADMIN_PAGE_HEAD[] PROGMEM = R"PAGE(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin — Community Hub</title>
 <style>
+
+/* iOS: ensure single-tap delivery on interactive elements. Without this, on
+   iPhone/iPad some links/buttons require two taps to fire because the first
+   gets consumed by gesture detection (especially when an ancestor uses
+   touch-action: none, or :active applies a transform). */
+a, button {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
 :root {
   --bg: #ede8de; --surface: #faf8f3; --surface2: #f0ebe0;
   --border: #b0a080; --border-light: #d4c9b0;
@@ -1100,7 +1118,7 @@ body {
   border-radius: var(--radius); color: var(--accent-light); cursor: pointer;
   font-family: inherit; font-size: 12px; font-weight: bold; letter-spacing: 1px; padding: 9px;
 }
-#gate button:hover { background: #3d6438; }
+@media (hover: hover) and (pointer: fine) { #gate button:hover { background: #3d6438; } }
 #gate .error { font-size: 11px; color: var(--danger); margin-top: 8px; text-align: center; min-height: 16px; }
 
 #panel { display: none; padding: 24px 20px; max-width: 640px; }
@@ -1134,9 +1152,9 @@ body {
   font-weight: bold; letter-spacing: 1px; padding: 7px 14px; transition: background .15s;
   white-space: nowrap;
 }
-.btn:hover { background: #3d6438; }
+@media (hover: hover) and (pointer: fine) { .btn:hover { background: #3d6438; } }
 .btn.danger { background: #8b1a10; border-color: #6b1208; }
-.btn.danger:hover { background: var(--danger); }
+@media (hover: hover) and (pointer: fine) { .btn.danger:hover { background: var(--danger); } }
 
 .feedback { font-size: 11px; color: var(--accent-dark); min-height: 16px; }
 textarea.restore-area {
@@ -1850,6 +1868,15 @@ const char WALL_HTML[] PROGMEM = R"PAGE(
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Wall — Community Hub</title>
 <style>
+
+/* iOS: ensure single-tap delivery on interactive elements. Without this, on
+   iPhone/iPad some links/buttons require two taps to fire because the first
+   gets consumed by gesture detection (especially when an ancestor uses
+   touch-action: none, or :active applies a transform). */
+a, button {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
 :root {
   --bg:           #faf6ec;
   --paper:        #fffaf0;
@@ -1938,7 +1965,7 @@ body {
   transition: transform .12s;
   flex-shrink: 0;
 }
-.color:hover  { transform: scale(1.1); }
+@media (hover: hover) and (pointer: fine) { .color:hover  { transform: scale(1.1); } }
 .color.active { border-color: var(--ink); box-shadow: 0 0 0 2px var(--paper) inset; }
 
 .brush {
@@ -1948,7 +1975,7 @@ body {
   transition: all .12s;
   flex-shrink: 0;
 }
-.brush:hover  { background: #f5efe0; }
+@media (hover: hover) and (pointer: fine) { .brush:hover  { background: #f5efe0; } }
 .brush.active { background: var(--accent-light); border-color: var(--accent-dark); }
 .brush .dot {
   background: var(--ink); border-radius: 50%;
@@ -1964,13 +1991,13 @@ body {
   padding: 6px 12px; transition: background .15s;
   flex-shrink: 0;
 }
-.btn:hover { background: #3d6438; }
+@media (hover: hover) and (pointer: fine) { .btn:hover { background: #3d6438; } }
 .btn:disabled { opacity: 0.4; cursor: default; }
 .btn.subtle {
   background: var(--paper); color: var(--ink-muted);
   border: 1px solid var(--border);
 }
-.btn.subtle:hover { background: #f5efe0; color: var(--ink); }
+@media (hover: hover) and (pointer: fine) { .btn.subtle:hover { background: #f5efe0; color: var(--ink); } }
 
 .spacer { flex: 1; }
 

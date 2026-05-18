@@ -847,6 +847,29 @@ String buildAdminPage() {
 DNSServer dnsServer;
 WebServer server(80);
 
+// CORS headers, queued before each response. Sent on every API endpoint so
+// the page works regardless of which origin the browser thinks loaded it,
+// which matters because:
+//   - iOS captive-portal flow can land the page at an Apple probe URL while
+//     fetches resolve to fountainhead.local, crossing origins
+//   - iOS Safari treats .local hostnames as a privacy boundary in some cases
+//   - The threat model on an AP-only board is "neighbor on the network," not
+//     cross-origin attackers, so * is fine
+// Expose-Headers is needed so the wall page can read X-Server-Now under CORS.
+void addCors() {
+  server.sendHeader("Access-Control-Allow-Origin",  "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.sendHeader("Access-Control-Expose-Headers", "X-Server-Now");
+}
+
+// Some browsers (or iOS in certain modes) send an OPTIONS preflight before the
+// real request. We just need to respond 204 with the CORS headers set.
+void handleOptions() {
+  addCors();
+  server.send(204);
+}
+
 bool checkKey() {
   if (sessionToken.length() == 0)                      return false;
   if (millis() - tokenIssuedAt > TOKEN_LIFETIME_MS)    return false;
@@ -891,6 +914,7 @@ void handleWall() {
 }
 
 void handleAdminAuth() {
+  addCors();
   DynamicJsonDocument doc(256);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad request");
@@ -906,6 +930,7 @@ void handleAdminAuth() {
 }
 
 void handleInfo() {
+  addCors();
   DynamicJsonDocument doc(512);
   doc["name"]     = id_name;
   doc["icon"]     = id_icon;
@@ -927,6 +952,7 @@ void handleInfo() {
 // flushed; peak transient RAM stays around 1-2 KB regardless of board size.
 // Replaces the old approach of a single 20 KB document.
 void handleMessages() {
+  addCors();
   unsigned long now = nowSecs();
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -986,6 +1012,7 @@ void handleMessages() {
 }
 
 void handlePost() {
+  addCors();
   DynamicJsonDocument doc(2048);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json");
@@ -1035,6 +1062,7 @@ void handlePost() {
 }
 
 void handlePostEdit() {
+  addCors();
   DynamicJsonDocument doc(1024);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json"); return;
@@ -1055,6 +1083,7 @@ void handlePostEdit() {
 }
 
 void handlePostDelete() {
+  addCors();
   DynamicJsonDocument doc(512);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json"); return;
@@ -1076,6 +1105,7 @@ void handlePostDelete() {
 }
 
 void handlePostClaim() {
+  addCors();
   DynamicJsonDocument doc(512);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json"); return;
@@ -1104,6 +1134,7 @@ void handlePostClaim() {
 }
 
 void handlePostUnclaim() {
+  addCors();
   DynamicJsonDocument doc(512);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json"); return;
@@ -1129,6 +1160,7 @@ void handlePostUnclaim() {
 }
 
 void handlePollVote() {
+  addCors();
   DynamicJsonDocument doc(512);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json"); return;
@@ -1153,6 +1185,7 @@ void handlePollVote() {
 // not bulletproof (clear-and-react again works), but the trust model here
 // matches the rest of the board.
 void handlePostReact() {
+  addCors();
   DynamicJsonDocument doc(256);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json"); return;
@@ -1201,6 +1234,7 @@ void pruneWaves() {
 }
 
 void handleWavePost() {
+  addCors();
   DynamicJsonDocument doc(256);
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "bad json"); return;
@@ -1231,6 +1265,15 @@ void handleWavePost() {
 }
 
 void handleWaveRecent() {
+  addCors();
+  // Safari 18+ has a keep-alive reuse bug that surfaces as "Fetch API cannot
+  // load ... due to access control checks" when a connection is reused after
+  // the server (in our case the ESP32) has already closed it. The wave poll
+  // runs every 4 seconds, well inside the keep-alive window where the race
+  // happens. Forcing Connection: close means each poll opens a fresh TCP
+  // connection, sidestepping the bug entirely.
+  // https://discussions.apple.com/thread/256112607
+  server.sendHeader("Connection", "close");
   uint32_t since = 0;
   if (server.hasArg("since")) since = (uint32_t)server.arg("since").toInt();
   pruneWaves();
@@ -1395,6 +1438,7 @@ void loadWall() {
 // subsequent writes are ignored. We must call send() with the headers, then
 // use sendContent() repeatedly to stream the body.
 void handleWallGet() {
+  addCors();
   pruneStrokes();
 
   String chunk;
@@ -1434,6 +1478,7 @@ void handleWallGet() {
 // POST /wall/stroke — add a new stroke
 //   Body: { color, width, points: [x0,y0,x1,y1,...] }
 void handleWallStroke() {
+  addCors();
   if (!strokes) { server.send(503, "text/plain", "wall unavailable"); return; }
   DynamicJsonDocument doc(2048);
   if (deserializeJson(doc, server.arg("plain"))) {
@@ -1499,6 +1544,7 @@ void handleWallStroke() {
 // GET /wall/info — small endpoint for the "wall has N new strokes" indicator
 // on the main board header. Returns latest stroke id and total stroke count.
 void handleWallInfo() {
+  addCors();
   pruneStrokes();
   uint32_t latestId = 0;
   for (int i = 0; i < strokeCount; i++) {
@@ -1515,6 +1561,7 @@ void handleWallInfo() {
 
 // Admin-only: wipe the wall
 void handleAdminWallClear() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   strokeCount = 0;
   saveWall();
@@ -1526,6 +1573,7 @@ void handleAdminWallClear() {
 // kept unauthenticated so it can be polled by external dashboards or an e-paper
 // companion device. Add checkKey() at the top if you'd rather gate it.
 void handleHealth() {
+  addCors();
   DynamicJsonDocument doc(512);
 
   // Heap
@@ -1580,6 +1628,7 @@ void handleHealth() {
 // ── Admin handlers ────────────────────────────────────────────────────────────
 
 void handleAdminIdentityGet() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   DynamicJsonDocument doc(1024);
   doc["name"]              = id_name;
@@ -1595,6 +1644,7 @@ void handleAdminIdentityGet() {
 }
 
 void handleAdminIdentitySet() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   if (server.hasArg("name")    && server.arg("name").length())
     id_name    = sanitize(server.arg("name"),    48);
@@ -1620,6 +1670,7 @@ void handleAdminIdentitySet() {
 }
 
 void handleAdminTime() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   if (!setTimeFromString(server.arg("time"))) {
     server.send(400, "text/plain", "bad format — use DDMMYYYY-HHMM");
@@ -1630,6 +1681,7 @@ void handleAdminTime() {
 }
 
 void handleAdminLedGet() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   DynamicJsonDocument doc(512);
   doc["day_br"]   = led_day_brightness;
@@ -1646,6 +1698,7 @@ void handleAdminLedGet() {
 }
 
 void handleAdminLedSet() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   if (server.hasArg("day_br"))   led_day_brightness   = constrain(server.arg("day_br").toInt(),   0, 100);
   if (server.hasArg("night_br")) led_night_brightness = constrain(server.arg("night_br").toInt(), 0, 100);
@@ -1668,6 +1721,7 @@ void handleAdminLedSet() {
 }
 
 void handleAdminBackup() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   if (msgsDirty) { saveMessages(); msgsDirty = false; }
   File f = LittleFS.open(Config::STORAGE_FILE);
@@ -1678,6 +1732,7 @@ void handleAdminBackup() {
 }
 
 void handleAdminRestore() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   DynamicJsonDocument doc(MSG_LOAD_DOC_SIZE);
   if (deserializeJson(doc, server.arg("plain"))) {
@@ -1736,6 +1791,7 @@ void handleAdminRestore() {
 }
 
 void handleAdminSetKey() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   String newKey = server.arg("newkey");
   newKey.trim();
@@ -1749,6 +1805,7 @@ void handleAdminSetKey() {
 }
 
 void handleAdminOTA() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   server.send(200, "text/plain", Update.hasError() ? "UPDATE FAILED" : "UPDATE OK — rebooting");
   delay(500);
@@ -1771,6 +1828,7 @@ void handleAdminOTAUpload() {
 }
 
 void handleAdminFlush() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   saveMessages();
   msgsDirty = false;
@@ -1781,6 +1839,7 @@ void handleAdminFlush() {
 }
 
 void handleAdminDeletePost() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   if (!server.hasArg("id")) { server.send(400, "text/plain", "missing id"); return; }
   uint16_t targetId = (uint16_t)server.arg("id").toInt();
@@ -1796,6 +1855,7 @@ void handleAdminDeletePost() {
 
 // ── Pinned post ──────────────────────────────────────────────────────────────
 void handleAdminPin() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   if (!server.hasArg("id")) { server.send(400, "text/plain", "missing id"); return; }
   uint16_t target = (uint16_t)server.arg("id").toInt();
@@ -1810,6 +1870,7 @@ void handleAdminPin() {
 }
 
 void handleAdminUnpin() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   pinnedMsgId = 0;
   savePinned();
@@ -1820,6 +1881,7 @@ void handleAdminUnpin() {
 // Superset of /api/health, with the in-RAM counters and a type breakdown.
 // Auth-gated so cumulative activity isn't visible to general clients.
 void handleAdminStats() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   DynamicJsonDocument doc(1024);
 
@@ -1872,6 +1934,7 @@ void handleAdminStats() {
 }
 
 void handleAdminClear() {
+  addCors();
   if (!checkKey()) { server.send(403, "text/plain", "forbidden"); return; }
   for (int i = 0; i < MAX_POLLS; i++) freePoll(polls[i].msgId);
   pinnedMsgId = 0;
@@ -1966,6 +2029,7 @@ void setup() {
   server.on("/wall/info",    HTTP_GET,  handleWallInfo);
 
   server.on("/api/status", HTTP_GET, []() {
+    addCors();
     unsigned long now = nowSecs();
     bool hasExpired = false;
     for (int i = 0; i < msgCount; i++) {
@@ -2015,6 +2079,24 @@ void setup() {
   server.on("/admin/pin",           handleAdminPin);
   server.on("/admin/unpin",         handleAdminUnpin);
   server.on("/admin/stats",         handleAdminStats);
+
+  // CORS preflight catch-all. The browser sends OPTIONS before any
+  // cross-origin request with a non-simple Content-Type or custom header. We
+  // respond 204 + headers via addCors() so the actual request can proceed.
+  // Registered for the AJAX endpoints; HTML page paths fall through to
+  // onNotFound (which redirects to /, harmless for OPTIONS).
+  for (const char* p : {
+    "/info", "/messages", "/post", "/post/edit", "/post/delete",
+    "/post/claim", "/post/unclaim", "/post/react", "/poll/vote",
+    "/wave", "/wave/recent", "/wall/data", "/wall/stroke", "/wall/info",
+    "/api/status", "/api/health", "/admin/auth",
+    "/admin/identity/get", "/admin/identity/set", "/admin/time",
+    "/admin/led/get", "/admin/led/set", "/admin/backup", "/admin/restore",
+    "/admin/setkey", "/admin/flush", "/admin/clear", "/admin/wall/clear",
+    "/admin/delete/post", "/admin/pin", "/admin/unpin", "/admin/stats",
+  }) {
+    server.on(p, HTTP_OPTIONS, handleOptions);
+  }
 
   server.onNotFound([]() { server.sendHeader("Location", "/"); server.send(302); });
 
