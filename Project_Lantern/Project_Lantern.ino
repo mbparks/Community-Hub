@@ -57,8 +57,8 @@ namespace Config {
   // SSID is what neighbours see in their WiFi list.
   // AP_PASS must be empty for an open network, or 8+ characters for WPA2.
   // Anything 1-7 chars will cause softAP() to fail silently.
-  const char* AP_SSID     = "Fountain Head Hub";
-  const char* AP_PASS     = "fountain";        // "" = open network
+  const char* AP_SSID     = "SunburyLantern";
+  const char* AP_PASS     = "";        // "" = open network
   const int   AP_CHANNEL  = 6;
   const int   AP_MAX_CONN = 20;
 
@@ -851,7 +851,7 @@ WebServer server(80);
 // the page works regardless of which origin the browser thinks loaded it,
 // which matters because:
 //   - iOS captive-portal flow can land the page at an Apple probe URL while
-//     fetches resolve to fountainhead.local, crossing origins
+//     fetches resolve to <yourssidhere>.local, crossing origins
 //   - iOS Safari treats .local hostnames as a privacy boundary in some cases
 //   - The threat model on an AP-only board is "neighbor on the network," not
 //     cross-origin attackers, so * is fine
