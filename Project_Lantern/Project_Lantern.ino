@@ -58,7 +58,7 @@ namespace Config {
   // AP_PASS must be empty for an open network, or 8+ characters for WPA2.
   // Anything 1-7 chars will cause softAP() to fail silently.
   const char* AP_SSID     = "Sunbury Hub";
-  const char* AP_PASS     = "sunbury";        // "" = open network
+  const char* AP_PASS     = "sunbury123";        // "" = open network
   const int   AP_CHANNEL  = 6;
   const int   AP_MAX_CONN = 20;
 
