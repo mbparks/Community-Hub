@@ -519,8 +519,30 @@ function esc(s) {
                   .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+// Message expiry is computed against the SERVER's clock, not the browser's.
+// The server stamps /messages with an X-Server-Now header (and /info with a
+// "now" field) carrying its current epoch. On a board whose clock hasn't been
+// set, that value is "seconds since boot" rather than a real Unix epoch.
+// Without this alignment, the browser compares `expires` against Date.now()
+// and every post renders as already-expired the instant it loads.
+let boardEpochOffsetSecs = 0;   // serverNow - clientNow at last sync
+let haveBoardOffset      = false;
+
+function boardClientNowSec() { return Math.floor(Date.now() / 1000); }
+function boardServerNowSec() {
+  return haveBoardOffset ? (boardClientNowSec() + boardEpochOffsetSecs)
+                         : boardClientNowSec();
+}
+function syncBoardNow(secs) {
+  if (secs === undefined || secs === null) return;
+  const n = Number(secs);
+  if (!isFinite(n)) return;
+  boardEpochOffsetSecs = n - boardClientNowSec();
+  haveBoardOffset = true;
+}
+
 function timeLeft(expSecs) {
-  const left = expSecs - Math.floor(Date.now() / 1000);
+  const left = expSecs - boardServerNowSec();
   if (left <= 0)    return { label: 'expired',   soon: true  };
   if (left < 3600)  return { label: Math.floor(left / 60)    + 'm left', soon: true  };
   if (left < 86400) return { label: Math.floor(left / 3600)  + 'h left', soon: left < 10800 };
@@ -643,6 +665,7 @@ async function load() {
   try {
     checkBoardStatus();
     const r  = await fetch('/messages');
+    syncBoardNow(r.headers.get('X-Server-Now'));
     lastData = await r.json();
     pruneLocalMaps(lastData.map(m => m.id));
     render(lastData);
@@ -1020,6 +1043,7 @@ async function updateWallBadge() {
 // ── Board info ────────────────────────────────────────────────────────────────
 function loadInfo() {
   fetch('/info').then(r => r.json()).then(d => {
+    syncBoardNow(d.now);
     document.getElementById('boardTitle').textContent   = d.icon + '  ' + d.name;
     document.getElementById('boardRules').textContent   = d.rules;
     document.getElementById('boardFooter').textContent  = d.footer;
@@ -1637,8 +1661,25 @@ function confirmClearWall() {
 }
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// Admin scope mirrors the main board's server-time alignment so the "Xh left"
+// labels in the post list match what the board computes. Synced from the
+// "now" field on /info (fetched by loadPostList) and the X-Server-Now header.
+let adminEpochOffsetSecs = 0;
+let haveAdminOffset      = false;
+function adminSyncNow(secs) {
+  if (secs === undefined || secs === null) return;
+  const n = Number(secs);
+  if (!isFinite(n)) return;
+  adminEpochOffsetSecs = n - Math.floor(Date.now() / 1000);
+  haveAdminOffset = true;
+}
+function adminServerNowSec() {
+  return haveAdminOffset ? (Math.floor(Date.now() / 1000) + adminEpochOffsetSecs)
+                         : Math.floor(Date.now() / 1000);
+}
 function timeLeftShort(exp) {
-  const left = exp - Math.floor(Date.now() / 1000);
+  const left = exp - adminServerNowSec();
   if (left <= 0)     return 'expired';
   if (left < 3600)   return Math.floor(left/60) + 'm';
   if (left < 86400)  return Math.floor(left/3600) + 'h';
@@ -1672,7 +1713,9 @@ async function loadPostList() {
       fetch('/info'),
       fetch('/messages')
     ]);
+    adminSyncNow(msgsR.headers.get('X-Server-Now'));
     const info = await infoR.json();
+    adminSyncNow(info.now);
     const data = await msgsR.json();
     adminPinnedId = Number(info.pinned || 0);
     renderPinnedStatus();

@@ -35,13 +35,13 @@
 namespace Config {
   //========= Defaults — overridable at runtime via admin panel ========//
 
-  const char* LOCALITY_NAME = "Community Hub";
-  const char* BOARD_ICON    = "🌱";
+  const char* LOCALITY_NAME = "Sunbury Lantern";
+  const char* BOARD_ICON    = "☀️";
   const char* BOARD_TAGLINE = "Take what you need • Share what you can";
   const char* BOARD_RULES   = "Be local • Be kind • No spam";
   const char* BOARD_FOOTER  = "Powered locally — no internet required";
 
-  const char* ADMIN_KEY = "change_me"; // Please definintely do, either here or in the admin panel.
+  const char* ADMIN_KEY = "1234"; // Please definintely do, either here or in the admin panel.
 
   const int LED_PIN = 4; 
  
@@ -57,8 +57,8 @@ namespace Config {
   // SSID is what neighbours see in their WiFi list.
   // AP_PASS must be empty for an open network, or 8+ characters for WPA2.
   // Anything 1-7 chars will cause softAP() to fail silently.
-  const char* AP_SSID     = "SunburyLantern";
-  const char* AP_PASS     = "";        // "" = open network
+  const char* AP_SSID     = "Sunbury Hub";
+  const char* AP_PASS     = "sunbury";        // "" = open network
   const int   AP_CHANNEL  = 6;
   const int   AP_MAX_CONN = 20;
 
@@ -851,7 +851,7 @@ WebServer server(80);
 // the page works regardless of which origin the browser thinks loaded it,
 // which matters because:
 //   - iOS captive-portal flow can land the page at an Apple probe URL while
-//     fetches resolve to <yourssidhere>.local, crossing origins
+//     fetches resolve to fountainhead.local, crossing origins
 //   - iOS Safari treats .local hostnames as a privacy boundary in some cases
 //   - The threat model on an AP-only board is "neighbor on the network," not
 //     cross-origin attackers, so * is fine
@@ -940,6 +940,7 @@ void handleInfo() {
   doc["hostname"] = effectiveHostname();
   doc["uptime"]   = formatUptime();
   doc["pinned"]   = pinnedMsgId;   // 0 = nothing pinned
+  doc["now"]      = nowSecs();     // server epoch, for client-side expiry math
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -955,6 +956,12 @@ void handleMessages() {
   addCors();
   unsigned long now = nowSecs();
 
+  // Carry the server's epoch so the client can compute "time left" against the
+  // same clock the server used to set `expires`. On a board with an unset
+  // clock, nowSecs() is seconds-since-boot, not a real Unix epoch; without
+  // this, the browser compares against Date.now() and every post looks
+  // already-expired the moment it loads.
+  server.sendHeader("X-Server-Now", String(now));
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");  // headers only
 
